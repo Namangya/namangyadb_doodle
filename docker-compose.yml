@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  db_source:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: source_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/init_source.sql:/docker-entrypoint-initdb.d/init.sql
+
+  db_target:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: target_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./scripts/init_target.sql:/docker-entrypoint-initdb.d/init.sql

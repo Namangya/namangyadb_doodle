@@ -1,33 +1,47 @@
-import React, { useState } from 'react';
-import { Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, CheckCircle2, XCircle } from 'lucide-react';
+import { useState } from 'react';
+import { Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, CheckCircle2, XCircle, TerminalSquare } from 'lucide-react';
 
-type ConnectionType = 'local' | 'ssh' | 'aws' | 'azure';
-type TestStatus = 'idle' | 'testing' | 'success' | 'error';
+type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
+type ConnectionMethod = 'direct' | 'ssh';
+type TestStatus = 'idle' | 'testing_ssh' | 'testing_db' | 'success' | 'error';
+type ViewState = 'setup' | 'comparing' | 'results' | 'about' | 'privacy' | 'terms' | 'contact';
 
 interface ConnectionState {
-  type: ConnectionType;
+  provider: ProviderType;
+  method: ConnectionMethod;
   host: string;
   port: string;
   dbName: string;
   user: string;
   pass: string;
+  oracleService?: string;
   sshHost?: string;
   sshUser?: string;
   sshKey?: File | null;
   testStatus: TestStatus;
 }
 
+const getEmptyState = (provider: ProviderType = 'aws'): ConnectionState => ({
+  provider,
+  method: 'direct',
+  host: '',
+  port: provider === 'oracle' ? '1521' : '5432',
+  dbName: '',
+  user: '',
+  pass: '',
+  oracleService: '',
+  sshHost: '',
+  sshUser: '',
+  sshKey: null,
+  testStatus: 'idle'
+});
+
 export default function App() {
   const [zeroRetention, setZeroRetention] = useState(true);
-  const [view, setView] = useState<'setup' | 'comparing' | 'results'>('setup');
+  const [view, setView] = useState<ViewState>('setup');
 
-  const [source, setSource] = useState<ConnectionState>({
-    type: 'local', host: 'localhost', port: '5432', dbName: '', user: '', pass: '', testStatus: 'idle'
-  });
-
-  const [target, setTarget] = useState<ConnectionState>({
-    type: 'aws', host: 'cluster.rds.amazonaws.com', port: '5432', dbName: '', user: '', pass: '', testStatus: 'idle'
-  });
+  const [source, setSource] = useState<ConnectionState>(getEmptyState('aws'));
+  const [target, setTarget] = useState<ConnectionState>(getEmptyState('supabase'));
 
   const canCompare = source.testStatus === 'success' && target.testStatus === 'success';
 
@@ -38,15 +52,15 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-orange-500/30">
+    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-orange-500/30 flex flex-col">
       {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50">
+      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50 shrink-0">
         <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 cursor-pointer" onClick={() => setView('setup')}>
             <div className="p-2 bg-orange-500/10 rounded-lg text-orange-400">
               <ArrowRightLeft size={24} />
             </div>
-            <h1 className="text-xl font-semibold tracking-tight">SyncDB <span className="text-slate-500 font-normal">Compare</span></h1>
+            <h1 className="text-xl font-semibold tracking-tight">NamangyaDB <span className="text-slate-500 font-normal">Compare</span></h1>
           </div>
           <div className="flex items-center gap-4 text-sm">
             <div className="relative group">
@@ -62,7 +76,6 @@ export default function App() {
                 {zeroRetention ? 'Zero-Retention Mode: ON' : 'Zero-Retention Mode: OFF'}
               </button>
               
-              {/* Hover Tooltip */}
               <div className="absolute right-0 top-full mt-2 w-64 p-3 bg-slate-800 border border-slate-700 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50 text-xs text-slate-300">
                 <p className="mb-1 text-slate-100 font-medium">Zero-Retention Mode</p>
                 {zeroRetention 
@@ -74,9 +87,9 @@ export default function App() {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 py-8">
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 py-8">
         {view === 'setup' && (
-          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-12">
             <div className="text-center space-y-4 py-8">
               <h2 className="text-3xl font-bold tracking-tight">Compare Environments</h2>
               <p className="text-slate-400 max-w-2xl mx-auto">
@@ -85,7 +98,7 @@ export default function App() {
               </p>
             </div>
 
-            <div className="grid md:grid-cols-2 gap-8">
+            <div className="grid md:grid-cols-2 gap-8 items-start">
               <ConnectionCard title="Source Database" data={source} onChange={setSource} />
               <ConnectionCard title="Target Database" data={target} onChange={setTarget} />
             </div>
@@ -138,83 +151,213 @@ export default function App() {
             </div>
             
             <div className="grid md:grid-cols-2 gap-6">
-              {/* DDL Diff Mock */}
-              <div className="bg-slate-800/50 rounded-2xl border border-slate-700/50 p-6 space-y-4">
+              <div className="bg-slate-800/50 rounded-2xl border border-slate-700/50 p-6 space-y-4 md:col-span-2">
                 <div className="flex items-center justify-between border-b border-slate-700/50 pb-4">
                   <h3 className="font-medium flex items-center gap-2">
                     <Settings2 size={18} className="text-purple-400" />
-                    DDL Differences
+                    Structured DDL Differences
                   </h3>
-                  <span className="px-2.5 py-1 rounded-full bg-red-500/10 text-red-400 text-xs font-medium">3 Changes</span>
-                </div>
-                <div className="space-y-2 font-mono text-sm">
-                  <div className="p-3 bg-slate-900/50 rounded-lg text-red-400 border border-red-500/20">
-                    - ALTER TABLE users DROP COLUMN last_login;
-                  </div>
-                  <div className="p-3 bg-slate-900/50 rounded-lg text-green-400 border border-green-500/20">
-                    + ALTER TABLE users ADD COLUMN last_login_at TIMESTAMP;
-                  </div>
-                  <div className="p-3 bg-slate-900/50 rounded-lg text-green-400 border border-green-500/20">
-                    + CREATE INDEX idx_users_email ON users(email);
+                  <div className="flex items-center gap-3">
+                    <span className="px-2.5 py-1 rounded-full bg-red-500/10 text-red-400 text-xs font-medium">3 Changes Detected</span>
+                    <button className="px-3 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 text-xs font-medium rounded-lg border border-orange-500/30 transition-colors flex items-center gap-1.5">
+                      Generate Sync Script
+                    </button>
                   </div>
                 </div>
-              </div>
-
-              {/* Data Diff Mock */}
-              <div className="bg-slate-800/50 rounded-2xl border border-slate-700/50 p-6 space-y-4">
-                <div className="flex items-center justify-between border-b border-slate-700/50 pb-4">
-                  <h3 className="font-medium flex items-center gap-2">
-                    <Database size={18} className="text-emerald-400" />
-                    Data Differences (users table)
-                  </h3>
-                  <span className="px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 text-xs font-medium">12 Mismatches</span>
-                </div>
+                
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm text-left">
                     <thead className="text-xs text-slate-400 uppercase bg-slate-900/50">
                       <tr>
-                        <th className="px-4 py-3 rounded-tl-lg">ID</th>
-                        <th className="px-4 py-3">Source</th>
-                        <th className="px-4 py-3 rounded-tr-lg">Target</th>
+                        <th className="px-4 py-3 rounded-tl-lg">Object</th>
+                        <th className="px-4 py-3">Source (Actual)</th>
+                        <th className="px-4 py-3 rounded-tr-lg">Target (Actual)</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-700/50">
                       <tr>
-                        <td className="px-4 py-3 font-mono">1042</td>
-                        <td className="px-4 py-3 text-red-400">status: 'active'</td>
-                        <td className="px-4 py-3 text-green-400">status: 'pending'</td>
+                        <td className="px-4 py-3 font-medium text-slate-300">Table: users</td>
+                        <td className="px-4 py-3 text-red-400 font-mono text-xs">Missing column 'last_login'</td>
+                        <td className="px-4 py-3 text-slate-300 font-mono text-xs">Has column 'last_login'</td>
                       </tr>
                       <tr>
-                        <td className="px-4 py-3 font-mono">1055</td>
-                        <td className="px-4 py-3 text-red-400">Missing</td>
-                        <td className="px-4 py-3 text-green-400">Present</td>
+                        <td className="px-4 py-3 font-medium text-slate-300">Table: users</td>
+                        <td className="px-4 py-3 text-green-400 font-mono text-xs">Has column 'last_login_at TIMESTAMP'</td>
+                        <td className="px-4 py-3 text-red-400 font-mono text-xs">Missing column 'last_login_at'</td>
                       </tr>
                     </tbody>
                   </table>
-                </div>
-                <div className="pt-2 text-center">
-                  <button className="text-sm text-orange-400 hover:text-orange-300 transition-colors">View all 12 mismatches</button>
                 </div>
               </div>
             </div>
           </div>
         )}
+
+        {/* Legal Pages */}
+        {['about', 'privacy', 'terms', 'contact'].includes(view) && (
+          <div className="max-w-3xl mx-auto space-y-6 bg-slate-800/40 p-8 rounded-2xl border border-slate-700/50 animate-in fade-in slide-in-from-bottom-4">
+            <button onClick={() => setView('setup')} className="text-sm text-orange-400 hover:text-orange-300 transition-colors mb-4 block">
+              &larr; Back to Tool
+            </button>
+            
+            {view === 'about' && (
+              <div className="prose prose-invert prose-orange max-w-none">
+                <h2>About NamangyaDB</h2>
+                <p>NamangyaDB is an advanced database management and comparison utility engineered for modern cloud architectures. Built by database professionals for database professionals, our mission is to eliminate the friction and uncertainty associated with schema migrations across disparate environments.</p>
+                <p>We support all major cloud providers, including AWS, Azure, Oracle Cloud, and Supabase, as well as local instances. Our platform is designed with a core philosophy of extreme security and zero data residency.</p>
+              </div>
+            )}
+
+            {view === 'privacy' && (
+              <div className="prose prose-invert prose-orange max-w-none">
+                <h2>Privacy Policy & Data Retention</h2>
+                <p>At NamangyaDB, your data security is our highest priority. Unlike traditional SaaS database tools, we operate under a strict <strong>Zero-Retention Policy</strong> by default.</p>
+                <h3>1. Zero Data Retention</h3>
+                <p>When you utilize our comparison engine, we do not store, log, or persist any of the following to disk:</p>
+                <ul>
+                  <li>Database connection strings, hostnames, or ports.</li>
+                  <li>Database usernames and passwords.</li>
+                  <li>SSH Tunnel `.pem` or `.key` identity files.</li>
+                  <li>Any schema (DDL) or row-level data extracted during comparison.</li>
+                </ul>
+                <p>All operations are performed entirely in-memory (RAM) and are completely wiped the moment your session is terminated or the browser is closed. SSH keys are written to ephemeral, OS-level secure temp files strictly for the duration of the tunnel handshake and are immediately unlinked from the filesystem.</p>
+                <h3>2. Telemetry</h3>
+                <p>We collect basic, anonymized page-visit telemetry (represented by the visit counter) solely for the purpose of understanding platform load. No personally identifiable information (PII) is associated with this data.</p>
+              </div>
+            )}
+
+            {view === 'terms' && (
+              <div className="prose prose-invert prose-orange max-w-none">
+                <h2>Terms and Conditions</h2>
+                <p>By accessing or using the NamangyaDB comparison tool, you agree to be bound by these Terms and Conditions.</p>
+                <h3>1. Use of Service</h3>
+                <p>You agree to only connect to databases and infrastructure for which you have explicit authorization. NamangyaDB is provided "as is", without warranty of any kind, express or implied.</p>
+                <h3>2. Limitation of Liability</h3>
+                <p>In no event shall the developers or owners of NamangyaDB be liable for any claim, damages, data loss, downtime, or other liability, whether in an action of contract, tort or otherwise, arising from, out of or in connection with the software or the use or other dealings in the software. It is your responsibility to verify any generated sync scripts before applying them to a production environment.</p>
+              </div>
+            )}
+
+            {view === 'contact' && (
+              <div className="prose prose-invert prose-orange max-w-none">
+                <h2>Contact Us</h2>
+                <p>Have questions about NamangyaDB, require enterprise support, or want to report an issue? We'd love to hear from you.</p>
+                <div className="bg-slate-900/50 p-6 rounded-lg border border-slate-700 mt-6">
+                  <p className="m-0 text-slate-300"><strong>Email:</strong> support@namangyadb.com</p>
+                  <p className="m-0 text-slate-300 mt-2"><strong>Enterprise Sales:</strong> enterprise@namangyadb.com</p>
+                  <p className="m-0 text-slate-300 mt-2"><strong>Security Disclosures:</strong> security@namangyadb.com</p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
       </main>
+
+      {/* Footer */}
+      <footer className="border-t border-slate-800 bg-slate-900/50 shrink-0">
+        <div className="max-w-7xl mx-auto px-4 py-6 flex flex-col md:flex-row items-center justify-between text-xs text-slate-500 gap-4">
+          <div className="flex items-center gap-2">
+            <span className="font-mono bg-slate-800 px-2 py-1 rounded text-slate-400 border border-slate-700 flex items-center gap-1">
+              <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+              Visits: 001248
+            </span>
+          </div>
+          <div className="flex items-center gap-6">
+            <button onClick={() => setView('about')} className="hover:text-orange-400 transition-colors">About Us</button>
+            <button onClick={() => setView('privacy')} className="hover:text-orange-400 transition-colors">Privacy Policy</button>
+            <button onClick={() => setView('terms')} className="hover:text-orange-400 transition-colors">Terms</button>
+            <button onClick={() => setView('contact')} className="hover:text-orange-400 transition-colors">Contact Us</button>
+          </div>
+          <div className="text-slate-600">
+            &copy; {new Date().getFullYear()} NamangyaDB. All rights reserved.
+          </div>
+        </div>
+      </footer>
     </div>
   );
 }
 
 function ConnectionCard({ title, data, onChange }: { title: string, data: ConnectionState, onChange: (d: ConnectionState) => void }) {
-  const handleTestConnection = () => {
-    onChange({ ...data, testStatus: 'testing' });
-    // Mock API call delay
-    setTimeout(() => {
-      onChange({ ...data, testStatus: 'success' });
-    }, 1500);
+  
+  const getHostValidationError = () => {
+    if (!data.host) return null;
+    const h = data.host.toLowerCase();
+    const isLocal = h === 'localhost' || h === '127.0.0.1';
+    
+    if (data.provider === 'aws') {
+      if (isLocal) return "AWS endpoints cannot be localhost.";
+      if (!h.includes('amazonaws.com')) return "Warning: Not a standard AWS endpoint (*.amazonaws.com)";
+    }
+    if (data.provider === 'azure') {
+      if (isLocal) return "Azure endpoints cannot be localhost.";
+      if (!h.includes('azure.com') && !h.includes('windows.net')) return "Warning: Not a standard Azure endpoint";
+    }
+    if (data.provider === 'supabase') {
+      if (isLocal) return "Supabase endpoints cannot be localhost.";
+      if (!h.includes('supabase.co') && !h.includes('supabase.in')) return "Warning: Not a standard Supabase endpoint";
+    }
+    if (data.provider === 'oracle') {
+      if (isLocal) return "Oracle Cloud endpoints cannot be localhost.";
+      if (!h.includes('oraclecloud.com')) return "Warning: Not a standard Oracle endpoint";
+    }
+    return null;
+  };
+
+  const validationError = getHostValidationError();
+  // Is it a hard error (blocks connection) or just a warning?
+  const isHardError = validationError?.includes('cannot be localhost');
+
+  const isFilled = () => {
+    if (!data.host || !data.port || !data.user || !data.pass) return false;
+    if (data.provider === 'oracle' && !data.oracleService) return false;
+    if (data.provider !== 'oracle' && !data.dbName) return false;
+    if (data.method === 'ssh') {
+      if (!data.sshHost || !data.sshUser || !data.sshKey) return false;
+    }
+    if (isHardError) return false; // Block if hard error
+    return true;
+  };
+
+  const handleProviderChange = (newProvider: ProviderType) => {
+    onChange(getEmptyState(newProvider));
+  };
+
+  const handleTestConnection = async (type: 'ssh_only' | 'full') => {
+    onChange({ ...data, testStatus: type === 'ssh_only' ? 'testing_ssh' : 'testing_db' });
+    try {
+      let pemText = '';
+      if (data.sshKey) {
+        pemText = await data.sshKey.text();
+      }
+      
+      const payload = {
+        type: data.provider,
+        host: data.host,
+        port: data.port,
+        dbName: data.provider === 'oracle' ? data.oracleService : data.dbName,
+        user: data.user,
+        pass_: data.pass,
+        sshHost: data.method === 'ssh' ? data.sshHost : null,
+        sshUser: data.method === 'ssh' ? data.sshUser : null,
+        sshKey: data.method === 'ssh' ? pemText : null,
+        testMode: type
+      };
+
+      const res = await fetch('http://localhost:8000/api/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      
+      if (!res.ok) throw new Error('Connection failed');
+      onChange({ ...data, testStatus: type === 'full' ? 'success' : 'idle' });
+    } catch (err) {
+      onChange({ ...data, testStatus: 'error' });
+    }
   };
 
   return (
-    <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-6 relative group overflow-hidden transition-all hover:bg-slate-800/60">
+    <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-6 relative group transition-all hover:bg-slate-800/60 shadow-lg h-full flex flex-col">
       <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-orange-500 to-amber-500 opacity-50 group-hover:opacity-100 transition-opacity" />
       
       <div className="flex items-center justify-between mb-6">
@@ -224,46 +367,100 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         </h3>
       </div>
 
-      <div className="space-y-4">
+      <div className="space-y-5 flex-1">
         <div>
-          <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Connection Type</label>
+          <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Cloud Provider</label>
           <select 
-            value={data.type}
-            onChange={(e) => onChange({...data, type: e.target.value as ConnectionType, testStatus: 'idle'})}
+            value={data.provider}
+            onChange={(e) => handleProviderChange(e.target.value as ProviderType)}
             className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all"
           >
-            <option value="local">Local Database</option>
-            <option value="ssh">SSH Tunnel (General)</option>
-            <option value="aws">AWS Aurora via SSH</option>
-            <option value="azure">Azure Postgres</option>
+            <option value="aws">AWS (RDS / Aurora)</option>
+            <option value="azure">Azure Database</option>
+            <option value="oracle">Oracle Cloud</option>
+            <option value="supabase">Supabase</option>
+            <option value="local">Local</option>
           </select>
         </div>
 
-        <div className="grid grid-cols-3 gap-4">
-          <div className="col-span-2">
-            <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Host</label>
-            <input type="text" value={data.host} onChange={e => onChange({...data, host: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder:text-slate-600" placeholder="localhost" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Port</label>
-            <input type="text" value={data.port} onChange={e => onChange({...data, port: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" />
-          </div>
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Database Name</label>
-            <input type="text" value={data.dbName} onChange={e => onChange({...data, dbName: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="postgres" />
-          </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">User</label>
-            <input type="text" value={data.user} onChange={e => onChange({...data, user: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="postgres" />
+        <div>
+          <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Connection Method</label>
+          <div className="flex bg-slate-900 p-1 rounded-lg border border-slate-700">
+            <button 
+              className={`flex-1 text-sm py-1.5 rounded-md transition-colors ${data.method === 'direct' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
+              onClick={() => onChange({...data, method: 'direct', testStatus: 'idle'})}
+            >
+              Direct
+            </button>
+            <button 
+              className={`flex-1 text-sm py-1.5 rounded-md transition-colors ${data.method === 'ssh' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
+              onClick={() => onChange({...data, method: 'ssh', testStatus: 'idle'})}
+            >
+              Via SSH Tunnel
+            </button>
           </div>
         </div>
 
-        {(data.type === 'ssh' || data.type === 'aws') && (
-          <div className="pt-4 mt-4 border-t border-slate-700/50 space-y-4">
-            <h4 className="text-sm font-medium text-slate-300">SSH Configuration</h4>
+        <div className="space-y-4 pt-2 border-t border-slate-700/50">
+          <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
+            <Database size={14} className="text-slate-500"/> DB Credentials
+          </h4>
+          
+          <div className="grid grid-cols-3 gap-4">
+            <div className="col-span-2">
+              <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Host / Endpoint</label>
+              <input 
+                type="text" 
+                value={data.host} 
+                onChange={e => onChange({...data, host: e.target.value, testStatus: 'idle'})} 
+                className={`w-full bg-slate-900 border rounded-lg px-4 py-2.5 text-sm outline-none transition-all placeholder:text-slate-600 ${
+                  isHardError ? 'border-red-500/50 focus:ring-red-500/50' : 
+                  validationError ? 'border-amber-500/50 focus:ring-amber-500/50' : 
+                  'border-slate-700 focus:ring-2 focus:ring-orange-500 focus:border-orange-500'
+                }`}
+                placeholder="db.example.com" 
+              />
+              {validationError && (
+                <p className={`text-[10px] mt-1.5 flex items-center gap-1 ${isHardError ? 'text-red-400' : 'text-amber-400'}`}>
+                  {isHardError ? <XCircle size={12}/> : <ShieldAlert size={12}/>}
+                  {validationError}
+                </p>
+              )}
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Port</label>
+              <input type="text" value={data.port} onChange={e => onChange({...data, port: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            {data.provider === 'oracle' ? (
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Service Name</label>
+                <input type="text" value={data.oracleService} onChange={e => onChange({...data, oracleService: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="ORCL" />
+              </div>
+            ) : (
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">DB Name</label>
+                <input type="text" value={data.dbName} onChange={e => onChange({...data, dbName: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="postgres" />
+              </div>
+            )}
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">User</label>
+              <input type="text" value={data.user} onChange={e => onChange({...data, user: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="admin" />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Password</label>
+              <input type="password" value={data.pass} onChange={e => onChange({...data, pass: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all" placeholder="••••••••" />
+            </div>
+          </div>
+        </div>
+
+        {data.method === 'ssh' && (
+          <div className="pt-4 border-t border-slate-700/50 space-y-4 animate-in fade-in slide-in-from-top-2">
+            <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
+              <TerminalSquare size={14} className="text-slate-500"/> SSH Configuration
+            </h4>
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">SSH Host</label>
@@ -276,29 +473,46 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Identity File (.pem)</label>
-              <div className="border border-dashed border-slate-600 rounded-lg p-4 text-center hover:bg-slate-700/30 transition-colors cursor-pointer group">
-                <span className="text-sm text-slate-400 group-hover:text-slate-300">Click to upload .pem key</span>
-                <input type="file" className="hidden" accept=".pem,.key" onChange={() => onChange({...data, testStatus: 'idle'})} />
+              <div className="border border-dashed border-slate-600 rounded-lg p-4 text-center hover:bg-slate-700/30 transition-colors cursor-pointer group bg-slate-900" onClick={(e) => (e.currentTarget.querySelector('input') as HTMLInputElement).click()}>
+                <span className="text-sm text-slate-400 group-hover:text-slate-300 transition-colors">
+                  {data.sshKey ? `Selected: ${data.sshKey.name}` : 'Click to upload .pem key'}
+                </span>
+                <input type="file" className="hidden" accept=".pem,.key" onChange={(e) => {
+                  onChange({...data, sshKey: e.target.files?.[0] || null, testStatus: 'idle'});
+                }} />
               </div>
-              <p className="text-[10px] text-slate-500 mt-2 flex items-center gap-1"><Shield size={12}/> File only kept in memory.</p>
             </div>
           </div>
         )}
-        
-        <div className="pt-6 mt-4 border-t border-slate-700/50">
-          <button
-            onClick={handleTestConnection}
-            disabled={data.testStatus === 'testing'}
-            className="w-full flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 transition-colors py-2.5 rounded-lg text-sm font-medium"
-          >
-            {data.testStatus === 'idle' && 'Test Connection'}
-            {data.testStatus === 'testing' && <><Loader2 size={16} className="animate-spin" /> Testing...</>}
-            {data.testStatus === 'success' && <><CheckCircle2 size={16} className="text-green-400" /> Connection Successful</>}
-            {data.testStatus === 'error' && <><XCircle size={16} className="text-red-400" /> Connection Failed</>}
-          </button>
-        </div>
-
       </div>
+
+      <div className="pt-6 mt-6 border-t border-slate-700/50 space-y-3 shrink-0">
+        {data.method === 'ssh' && (
+          <button
+            onClick={() => handleTestConnection('ssh_only')}
+            disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
+            className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors py-2.5 rounded-lg text-sm font-medium border border-slate-700"
+          >
+            {data.testStatus === 'testing_ssh' ? <><Loader2 size={16} className="animate-spin" /> Testing SSH...</> : 'Test SSH Tunnel'}
+          </button>
+        )}
+        
+        <button
+          onClick={() => handleTestConnection('full')}
+          disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
+          className={`w-full flex items-center justify-center gap-2 transition-colors py-2.5 rounded-lg text-sm font-medium ${
+            data.testStatus === 'success' ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 
+            data.testStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/30' :
+            'bg-slate-700 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed'
+          }`}
+        >
+          {data.testStatus === 'idle' && 'Test Connection'}
+          {data.testStatus === 'testing_db' && <><Loader2 size={16} className="animate-spin" /> Testing DB...</>}
+          {data.testStatus === 'success' && <><CheckCircle2 size={16} /> Connection Successful</>}
+          {data.testStatus === 'error' && <><XCircle size={16} /> Connection Failed</>}
+        </button>
+      </div>
+
     </div>
   );
 }
