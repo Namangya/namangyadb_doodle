@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, CheckCircle2, XCircle, TerminalSquare } from 'lucide-react';
+import { Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, CheckCircle2, XCircle, TerminalSquare, Clock, Filter } from 'lucide-react';
 
 type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
 type ConnectionMethod = 'direct' | 'ssh';
 type TestStatus = 'idle' | 'testing_ssh' | 'testing_db' | 'success' | 'error';
-type ViewState = 'setup' | 'comparing' | 'results' | 'about' | 'privacy' | 'terms' | 'contact';
+type ViewState = 'setup' | 'preflight' | 'comparing' | 'results' | 'about' | 'privacy' | 'terms' | 'contact';
 
 interface ConnectionState {
   provider: ProviderType;
@@ -36,20 +36,120 @@ const getEmptyState = (provider: ProviderType = 'aws'): ConnectionState => ({
   testStatus: 'idle'
 });
 
+interface PreFlightData {
+  source_counts: Record<string, number>;
+  target_counts: Record<string, number>;
+  eta_seconds: number;
+  total_objects: number;
+}
+
 export default function App() {
   const [zeroRetention, setZeroRetention] = useState(true);
   const [view, setView] = useState<ViewState>('setup');
 
   const [source, setSource] = useState<ConnectionState>(getEmptyState('aws'));
   const [target, setTarget] = useState<ConnectionState>(getEmptyState('supabase'));
+  
+  const [isPreflightLoading, setIsPreflightLoading] = useState(false);
+  const [preflightData, setPreflightData] = useState<PreFlightData | null>(null);
+  const [diffs, setDiffs] = useState<any[]>([]);
+  
+  const [selectedObjects, setSelectedObjects] = useState<Record<string, boolean>>({
+    tables: true,
+    views: true,
+    functions: true,
+    sequences: true,
+    triggers: true
+  });
 
   const canCompare = source.testStatus === 'success' && target.testStatus === 'success';
 
-  const handleConnect = () => {
-    if (!canCompare) return;
-    setView('comparing');
-    setTimeout(() => setView('results'), 2000);
+  const preparePayload = async (data: ConnectionState) => {
+    let pemText = '';
+    if (data.sshKey) {
+      pemText = await data.sshKey.text();
+    }
+    return {
+      type: data.provider,
+      host: data.host,
+      port: data.port,
+      dbName: data.provider === 'oracle' ? data.oracleService : data.dbName,
+      user: data.user,
+      pass_: data.pass,
+      sshHost: data.method === 'ssh' ? data.sshHost : null,
+      sshUser: data.method === 'ssh' ? data.sshUser : null,
+      sshKey: data.method === 'ssh' ? pemText : null,
+      testMode: 'full'
+    };
   };
+
+  const handlePreflight = async () => {
+    if (!canCompare) return;
+    setIsPreflightLoading(true);
+    
+    try {
+      const sourcePayload = await preparePayload(source);
+      const targetPayload = await preparePayload(target);
+      
+      const res = await fetch('http://localhost:8000/api/compare/pre-flight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: sourcePayload,
+          target: targetPayload
+        })
+      });
+      
+      if (!res.ok) throw new Error('Failed to fetch preflight counts');
+      const data = await res.json();
+      setPreflightData(data);
+      setView('preflight');
+    } catch (err) {
+      alert("Failed to run preflight check: " + err);
+    } finally {
+      setIsPreflightLoading(false);
+    }
+  };
+
+  const handleStartComparison = async () => {
+    setView('comparing');
+    
+    try {
+      const sourcePayload = await preparePayload(source);
+      const targetPayload = await preparePayload(target);
+      
+      const res = await fetch('http://localhost:8000/api/compare/ddl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: sourcePayload,
+          target: targetPayload,
+          scope: selectedObjects
+        })
+      });
+      
+      if (!res.ok) throw new Error('Comparison failed');
+      const data = await res.json();
+      setDiffs(data.diffs);
+      setView('results');
+    } catch (err) {
+      alert("Comparison Error: " + err);
+      setView('preflight');
+    }
+  };
+  
+  const calculateDynamicEta = () => {
+    if (!preflightData) return 0;
+    let objects = 0;
+    for (const key of Object.keys(selectedObjects)) {
+      if (selectedObjects[key]) {
+        objects += (preflightData.source_counts[key] || 0) + (preflightData.target_counts[key] || 0);
+      }
+    }
+    return Math.max(1, Math.floor(objects * 0.05));
+  };
+  
+  const dynamicEta = calculateDynamicEta();
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-orange-500/30 flex flex-col">
@@ -105,18 +205,18 @@ export default function App() {
 
             <div className="flex flex-col items-center pt-8 gap-3">
               <button 
-                onClick={handleConnect}
-                disabled={!canCompare}
+                onClick={handlePreflight}
+                disabled={!canCompare || isPreflightLoading}
                 className={`group relative px-8 py-4 rounded-xl font-medium shadow-lg flex items-center gap-3 overflow-hidden transition-all ${
-                  canCompare 
+                  (canCompare && !isPreflightLoading)
                     ? 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20 cursor-pointer' 
                     : 'bg-slate-800 text-slate-500 cursor-not-allowed'
                 }`}
               >
-                {canCompare && <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />}
+                {(canCompare && !isPreflightLoading) && <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />}
                 <span className="relative z-10 flex items-center gap-2">
-                  <Play fill="currentColor" size={18} />
-                  Start Comparison
+                  {isPreflightLoading ? <Loader2 size={18} className="animate-spin" /> : <Play fill="currentColor" size={18} />}
+                  {isPreflightLoading ? 'Initializing Engine...' : 'Next: Configure Scope'}
                 </span>
               </button>
               {!canCompare && (
@@ -124,6 +224,83 @@ export default function App() {
                   Please test both connections successfully before starting the comparison.
                 </p>
               )}
+            </div>
+          </div>
+        )}
+        
+        {view === 'preflight' && preflightData && (
+          <div className="max-w-3xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 py-8">
+            <div className="text-center space-y-4">
+              <h2 className="text-3xl font-bold tracking-tight">Comparison Scope</h2>
+              <p className="text-slate-400">
+                We discovered a total of <span className="text-white font-medium">{preflightData.total_objects}</span> objects across both databases. 
+                Select what you want to compare to optimize performance.
+              </p>
+            </div>
+            
+            <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-8 relative overflow-hidden">
+              <div className="absolute top-0 right-0 p-8 opacity-5">
+                <Filter size={120} />
+              </div>
+              
+              <div className="relative z-10 grid sm:grid-cols-2 gap-8">
+                
+                <div className="space-y-4">
+                  <h3 className="font-medium flex items-center gap-2 border-b border-slate-700/50 pb-2">
+                    <Database size={16} className="text-orange-400" />
+                    Object Types
+                  </h3>
+                  
+                  {['tables', 'views', 'functions', 'sequences', 'triggers'].map(type => (
+                    <label key={type} className="flex items-center justify-between p-3 rounded-lg border border-slate-700/50 hover:bg-slate-700/30 cursor-pointer transition-colors bg-slate-900/50">
+                      <div className="flex items-center gap-3">
+                        <input 
+                          type="checkbox" 
+                          checked={selectedObjects[type]} 
+                          onChange={e => setSelectedObjects({...selectedObjects, [type]: e.target.checked})}
+                          className="w-4 h-4 text-orange-500 bg-slate-900 border-slate-700 rounded focus:ring-orange-500 focus:ring-2"
+                        />
+                        <span className="capitalize text-sm font-medium">{type}</span>
+                      </div>
+                      <span className="text-xs text-slate-400">
+                        {preflightData.source_counts[type]} (S) / {preflightData.target_counts[type]} (T)
+                      </span>
+                    </label>
+                  ))}
+                </div>
+                
+                <div className="flex flex-col justify-center items-center text-center p-6 bg-slate-900/50 border border-slate-700/50 rounded-xl space-y-4">
+                   <div className="p-4 bg-orange-500/10 rounded-full text-orange-400">
+                     <Clock size={32} />
+                   </div>
+                   <div>
+                     <p className="text-slate-400 text-sm">Estimated Completion Time</p>
+                     <p className="text-4xl font-bold tracking-tight mt-1 text-slate-100">
+                       ~{dynamicEta} <span className="text-xl text-slate-500 font-normal">sec</span>
+                     </p>
+                   </div>
+                   <p className="text-xs text-slate-500 max-w-[200px] mt-4">
+                     Time is based on the volume of structural metadata that needs to be extracted and diffed in memory.
+                   </p>
+                </div>
+                
+              </div>
+            </div>
+            
+            <div className="flex justify-center gap-4 pt-4">
+              <button 
+                onClick={() => setView('setup')}
+                className="px-6 py-3 rounded-xl font-medium border border-slate-700 hover:bg-slate-800 transition-colors"
+              >
+                Back
+              </button>
+              <button 
+                onClick={handleStartComparison}
+                className="px-8 py-3 rounded-xl font-medium bg-orange-600 hover:bg-orange-500 transition-colors shadow-lg shadow-orange-500/20 flex items-center gap-2"
+              >
+                <Play fill="currentColor" size={16} />
+                Confirm & Run Comparison
+              </button>
             </div>
           </div>
         )}
@@ -136,7 +313,7 @@ export default function App() {
             </div>
             <div className="text-center space-y-2">
               <h3 className="text-xl font-medium">Analyzing Environments</h3>
-              <p className="text-slate-400">Extracting DDL schemas securely...</p>
+              <p className="text-slate-400">Extracting and differing metadata securely in memory...</p>
             </div>
           </div>
         )}
@@ -158,7 +335,9 @@ export default function App() {
                     Structured DDL Differences
                   </h3>
                   <div className="flex items-center gap-3">
-                    <span className="px-2.5 py-1 rounded-full bg-red-500/10 text-red-400 text-xs font-medium">3 Changes Detected</span>
+                    <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${diffs.length > 0 ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'}`}>
+                      {diffs.length} Changes Detected
+                    </span>
                     <button className="px-3 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 text-xs font-medium rounded-lg border border-orange-500/30 transition-colors flex items-center gap-1.5">
                       Generate Sync Script
                     </button>
@@ -175,16 +354,23 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-700/50">
-                      <tr>
-                        <td className="px-4 py-3 font-medium text-slate-300">Table: users</td>
-                        <td className="px-4 py-3 text-red-400 font-mono text-xs">Missing column 'last_login'</td>
-                        <td className="px-4 py-3 text-slate-300 font-mono text-xs">Has column 'last_login'</td>
-                      </tr>
-                      <tr>
-                        <td className="px-4 py-3 font-medium text-slate-300">Table: users</td>
-                        <td className="px-4 py-3 text-green-400 font-mono text-xs">Has column 'last_login_at TIMESTAMP'</td>
-                        <td className="px-4 py-3 text-red-400 font-mono text-xs">Missing column 'last_login_at'</td>
-                      </tr>
+                      {diffs.length === 0 ? (
+                        <tr>
+                          <td colSpan={3} className="px-4 py-8 text-center text-slate-500 font-medium">No differences found! Schemas are perfectly aligned.</td>
+                        </tr>
+                      ) : (
+                        diffs.map((diff, i) => (
+                          <tr key={i} className="hover:bg-slate-800/30 transition-colors">
+                            <td className="px-4 py-3 font-medium text-slate-300">{diff.object}</td>
+                            <td className={`px-4 py-3 font-mono text-xs ${diff.status === 'missing_source' ? 'text-red-400' : diff.status === 'mismatch' ? 'text-amber-400' : 'text-green-400'}`}>
+                              {diff.source_actual}
+                            </td>
+                            <td className={`px-4 py-3 font-mono text-xs ${diff.status === 'missing_target' ? 'text-red-400' : diff.status === 'mismatch' ? 'text-amber-400' : 'text-slate-300'}`}>
+                              {diff.target_actual}
+                            </td>
+                          </tr>
+                        ))
+                      )}
                     </tbody>
                   </table>
                 </div>
