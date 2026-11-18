@@ -70,11 +70,15 @@ def compute_delta(source_snap, target_snap):
         # Indexes
         t_target_idxs = target_tables[t_name].get('indexes', {})
         for i_name, i_def in t_data.get('indexes', {}).items():
+            if i_name.endswith('_pkey') or i_name == f"{t_name}_pkey":
+                continue
             if i_name not in t_target_idxs:
                 add_diff('index', f"{t_name}.{i_name}", "Exists", "Missing", "missing_target", {'table': t_name, 'index_name': i_name, 'def': i_def})
             elif i_def.strip() != t_target_idxs[i_name].strip():
                 add_diff('index', f"{t_name}.{i_name}", "Definition differs", "Definition differs", "mismatch", {'table': t_name, 'index_name': i_name, 'source_def': i_def, 'target_def': t_target_idxs[i_name]})
         for i_name in t_target_idxs:
+            if i_name.endswith('_pkey') or i_name == f"{t_name}_pkey":
+                continue
             if i_name not in t_data.get('indexes', {}):
                 add_diff('index', f"{t_name}.{i_name}", "Missing", "Exists", "missing_source", {'table': t_name, 'index_name': i_name, 'def': t_target_idxs[i_name]})
 

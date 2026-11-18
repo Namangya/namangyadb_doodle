@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { 
-  Database, Shield, ShieldAlert, ShieldCheck, ArrowRightLeft, Play, Settings2, Loader2, 
+  Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, 
   CheckCircle2, XCircle, TerminalSquare, Clock, Filter, Copy, Check, Download, 
   Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2, Undo2
 } from 'lucide-react';
@@ -148,6 +148,10 @@ export default function App() {
   const [syncIncludeDdl, setSyncIncludeDdl] = useState(true);
   const [syncIncludeData, setSyncIncludeData] = useState(true);
   const [copied, setCopied] = useState(false);
+  const [copiedDdlIdx, setCopiedDdlIdx] = useState<number | null>(null);
+  const [copiedTable, setCopiedTable] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [modalCategoryFilter, setModalCategoryFilter] = useState<'all' | 'tables' | 'views' | 'routines' | 'data'>('all');
 
   const canCompare = source.testStatus === 'success' && target.testStatus === 'success';
   const [isTestingBoth, setIsTestingBoth] = useState(false);
@@ -311,17 +315,413 @@ export default function App() {
   
   const dynamicEta = calculateDynamicEta();
 
-  const handleFetchSyncScript = async (safe = syncSafeMode, withDdl = syncIncludeDdl, withData = syncIncludeData) => {
+  const formatSqlVal = (val: any): string => {
+    if (val === null || val === undefined) return 'NULL';
+    if (typeof val === 'boolean') return val ? 'TRUE' : 'FALSE';
+    if (typeof val === 'number') return String(val);
+    const s = String(val).replace(/'/g, "''");
+    return `'${s}'`;
+  };
+
+  const getSingleDdlSql = (diff: DdlDiff, sSnap: any, _tSnap: any): string => {
+    // 1. Table
+    if (diff.object_type === 'table') {
+      if (diff.status === 'missing_target') {
+        const tInfo = sSnap?.tables?.[diff.name || ''];
+        if (tInfo) {
+          const cols = tInfo.columns || {};
+          const pks: string[] = tInfo.primary_keys || [];
+          
+          // Auto-detect any referenced sequences in column defaults (e.g. nextval('order_id_seq'::regclass))
+          const seqs: Array<{ seqName: string; colName: string }> = [];
+          for (const [cName, cData] of Object.entries(cols)) {
+            const defStr = (cData as any)?.default || '';
+            const match = defStr.match(/nextval\('(?:\w+\.)?"?([a-zA-Z0-9_]+)"?'(?:::regclass)?\)/i);
+            if (match && match[1]) {
+              seqs.push({ seqName: match[1], colName: cName });
+            }
+          }
+
+          const parts: string[] = [];
+
+          // Pre-create sequences so nextval(...) regclass can resolve during CREATE TABLE
+          for (const s of seqs) {
+            parts.push(`CREATE SEQUENCE IF NOT EXISTS "${s.seqName}";`);
+          }
+
+          // Build CREATE TABLE
+          const colDefs: string[] = [];
+          for (const [cName, cData] of Object.entries(cols)) {
+            let colStr = `    "${cName}" ${(cData as any).type}`;
+            if ((cData as any).default) colStr += ` DEFAULT ${(cData as any).default}`;
+            if ((cData as any).nullable === 'NO') colStr += ` NOT NULL`;
+            colDefs.push(colStr);
+          }
+          if (pks.length > 0) {
+            colDefs.push(`    PRIMARY KEY (${pks.map((p: string) => `"${p}"`).join(', ')})`);
+          }
+          parts.push(`CREATE TABLE IF NOT EXISTS "${diff.name}" (\n${colDefs.join(',\n')}\n);`);
+
+          // Bind sequence ownership
+          for (const s of seqs) {
+            parts.push(`ALTER SEQUENCE "${s.seqName}" OWNED BY "${diff.name}"."${s.colName}";`);
+          }
+
+          // Secondary Indexes: skip primary key indexes, add IF NOT EXISTS
+          const idxs = tInfo.indexes || {};
+          for (const [idxName, idxDef] of Object.entries(idxs)) {
+            if (
+              idxName.endsWith('_pkey') || 
+              idxName === `${diff.name}_pkey` || 
+              pks.some((pk: string) => idxName === `${diff.name}_${pk}_key`)
+            ) {
+              continue;
+            }
+            let d = (idxDef as string).trim();
+            if (!d.endsWith(';')) d += ';';
+            if (!d.toUpperCase().includes('IF NOT EXISTS')) {
+              d = d.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+/i, '$1 IF NOT EXISTS ');
+            }
+            parts.push(d);
+          }
+
+          return parts.join('\n\n');
+        }
+        return `CREATE TABLE IF NOT EXISTS "${diff.name}";`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY TABLE]\nDROP TABLE IF EXISTS "${diff.name}" CASCADE;`;
+      }
+    }
+
+    // 2. Column
+    if (diff.object_type === 'column') {
+      const tableName = diff.raw_data?.table || (diff.name?.includes('.') ? diff.name.split('.')[0] : '');
+      const colName = diff.raw_data?.column || (diff.name?.includes('.') ? diff.name.split('.')[1] : diff.name || '');
+      if (diff.status === 'missing_target') {
+        const colData = diff.raw_data?.col_data || {};
+        const parts: string[] = [];
+        const defStr = colData.default || '';
+        const match = defStr.match(/nextval\('(?:\w+\.)?"?([a-zA-Z0-9_]+)"?'(?:::regclass)?\)/i);
+        if (match && match[1]) {
+          parts.push(`CREATE SEQUENCE IF NOT EXISTS "${match[1]}";`);
+        }
+        let colStr = `"${colName}" ${colData.type || 'text'}`;
+        if (colData.default) colStr += ` DEFAULT ${colData.default}`;
+        if (colData.nullable === 'NO') colStr += ` NOT NULL`;
+        parts.push(`ALTER TABLE "${tableName}" ADD COLUMN IF NOT EXISTS ${colStr};`);
+        if (match && match[1]) {
+          parts.push(`ALTER SEQUENCE "${match[1]}" OWNED BY "${tableName}"."${colName}";`);
+        }
+        return parts.join('\n');
+      } else if (diff.status === 'mismatch') {
+        const kind = diff.raw_data?.mismatch_kind;
+        const sCol = diff.raw_data?.source_col || {};
+        if (kind === 'type' || !kind) {
+          return `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" TYPE ${sCol.type} USING "${colName}"::${sCol.type};`;
+        } else if (kind === 'default') {
+          return sCol.default
+            ? `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" SET DEFAULT ${sCol.default};`
+            : `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" DROP DEFAULT;`;
+        } else if (kind === 'nullable') {
+          return sCol.nullable === 'NO'
+            ? `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" SET NOT NULL;`
+            : `ALTER TABLE "${tableName}" ALTER COLUMN "${colName}" DROP NOT NULL;`;
+        }
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY COLUMN]\nALTER TABLE "${tableName}" DROP COLUMN IF EXISTS "${colName}";`;
+      }
+    }
+
+    // 3. Index
+    if (diff.object_type === 'index') {
+      const idxName = diff.raw_data?.index_name || (diff.name?.includes('.') ? diff.name.split('.')[1] : diff.name || '');
+      if (idxName.endsWith('_pkey')) {
+        return `-- Index "${idxName}" is a PRIMARY KEY index managed automatically by the table's PRIMARY KEY constraint.`;
+      }
+      if (diff.status === 'missing_target') {
+        let def = diff.raw_data?.def || '';
+        if (!def.endsWith(';')) def += ';';
+        if (!def.toUpperCase().includes('IF NOT EXISTS')) {
+          def = def.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+/i, '$1 IF NOT EXISTS ');
+        }
+        return def || `CREATE INDEX IF NOT EXISTS "${idxName}";`;
+      } else if (diff.status === 'mismatch') {
+        let sDef = diff.raw_data?.source_def || '';
+        if (!sDef.trim().endsWith(';')) sDef = sDef.trim() + ';';
+        if (!sDef.toUpperCase().includes('IF NOT EXISTS')) {
+          sDef = sDef.replace(/^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+/i, '$1 IF NOT EXISTS ');
+        }
+        return `DROP INDEX IF EXISTS "${idxName}";\n${sDef}`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY INDEX]\nDROP INDEX IF EXISTS "${idxName}";`;
+      }
+    }
+
+    // 4. View
+    if (diff.object_type === 'view') {
+      const vName = diff.name || '';
+      if (diff.status === 'missing_target' || diff.status === 'mismatch') {
+        let def = (sSnap?.views?.[vName] || diff.raw_data?.def || '').trim();
+        if (!def.endsWith(';')) def += ';';
+        return `DROP VIEW IF EXISTS "${vName}" CASCADE;\nCREATE OR REPLACE VIEW "${vName}" AS\n${def}`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY VIEW]\nDROP VIEW IF EXISTS "${vName}";`;
+      }
+    }
+
+    // 5. Materialized View
+    if (diff.object_type === 'materialized_view') {
+      const mvName = diff.name || '';
+      if (diff.status === 'missing_target' || diff.status === 'mismatch') {
+        let def = (sSnap?.materialized_views?.[mvName] || diff.raw_data?.def || '').trim();
+        if (!def.endsWith(';')) def += ';';
+        return `DROP MATERIALIZED VIEW IF EXISTS "${mvName}";\nCREATE MATERIALIZED VIEW "${mvName}" AS\n${def}`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY MATVIEW]\nDROP MATERIALIZED VIEW IF EXISTS "${mvName}";`;
+      }
+    }
+
+    // 6. Function
+    if (diff.object_type === 'function') {
+      const fnName = diff.name || '';
+      if (diff.status === 'missing_target' || diff.status === 'mismatch') {
+        let def = (sSnap?.functions?.[fnName] || diff.raw_data?.def || '').trim();
+        if (!def.endsWith(';')) def += ';';
+        return def;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY FUNCTION]\nDROP FUNCTION IF EXISTS ${fnName};`;
+      }
+    }
+
+    // 7. Procedure
+    if (diff.object_type === 'procedure') {
+      const procName = diff.name || '';
+      if (diff.status === 'missing_target' || diff.status === 'mismatch') {
+        let def = (sSnap?.procedures?.[procName] || diff.raw_data?.def || '').trim();
+        if (!def.endsWith(';')) def += ';';
+        return def;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY PROCEDURE]\nDROP PROCEDURE IF EXISTS ${procName};`;
+      }
+    }
+
+    // 8. Sequence
+    if (diff.object_type === 'sequence') {
+      const seqName = diff.name || '';
+      if (diff.status === 'missing_target') {
+        return `CREATE SEQUENCE IF NOT EXISTS "${seqName}";`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY SEQUENCE]\nDROP SEQUENCE IF EXISTS "${seqName}";`;
+      }
+    }
+
+    // 9. Trigger
+    if (diff.object_type === 'trigger') {
+      const trName = diff.name || '';
+      const tObj = sSnap?.triggers?.[trName] || diff.raw_data?.def || {};
+      let def = (typeof tObj === 'object' ? tObj.def : String(tObj)) || '';
+      const tbl = typeof tObj === 'object' ? tObj.table : '';
+      if (!def.trim().endsWith(';')) def = def.trim() + ';';
+      if (diff.status === 'missing_target') {
+        return def;
+      } else if (diff.status === 'mismatch') {
+        return `DROP TRIGGER IF EXISTS "${trName}" ON "${tbl || 'table_name'}";\n${def}`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY TRIGGER]\nDROP TRIGGER IF EXISTS "${trName}" ON "${tbl || 'table_name'}";`;
+      }
+    }
+
+    // 10. Role / User
+    if (diff.object_type === 'role') {
+      const rName = diff.name || '';
+      const rData = diff.raw_data?.role_data || sSnap?.roles?.[rName] || {};
+      if (diff.status === 'missing_target') {
+        const opts: string[] = [];
+        opts.push(rData.can_login ? 'LOGIN' : 'NOLOGIN');
+        if (rData.superuser) opts.push('SUPERUSER');
+        if (rData.create_db) opts.push('CREATEDB');
+        if (rData.create_role) opts.push('CREATEROLE');
+        if (rData.inherit) opts.push('INHERIT');
+        return `DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${rName}') THEN CREATE ROLE "${rName}" WITH ${opts.join(' ')}; END IF; END $$;`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY ROLE]\nDROP ROLE IF EXISTS "${rName}";`;
+      }
+    }
+
+    // 11. Grant
+    if (diff.object_type === 'grant') {
+      const gData = diff.raw_data?.grant_data || {};
+      if (diff.status === 'missing_target') {
+        return `GRANT ${gData.privilege} ON "${gData.object_name}" TO "${gData.grantee}";`;
+      } else if (diff.status === 'missing_source') {
+        return `-- [TARGET ONLY PRIVILEGE]\nREVOKE ${gData.privilege} ON "${gData.object_name}" FROM "${gData.grantee}";`;
+      }
+    }
+
+    return `-- Difference: ${diff.object_type} ${diff.name || diff.object || ''} (${diff.status});`;
+  };
+
+  const getTableDataSyncSql = (tableName: string, tInfo: any): string => {
+    const lines: string[] = [];
+    lines.push(`-- Synchronization SQL for Table: "${tableName}"`);
+    const commonCols: string[] = tInfo.common_columns || [];
+
+    // 1. Missing rows in target -> INSERT
+    const missingTarget = tInfo.sample_missing_in_target || [];
+    if (missingTarget.length > 0) {
+      lines.push(`\n-- Insert missing rows (${missingTarget.length} sample rows)`);
+      for (const item of missingTarget) {
+        const row = item.row || {};
+        const colsToInsert = commonCols.filter(c => c in row);
+        const colsSql = colsToInsert.map(c => `"${c}"`).join(', ');
+        const valsSql = colsToInsert.map(c => formatSqlVal(row[c])).join(', ');
+        lines.push(`INSERT INTO "${tableName}" (${colsSql}) VALUES (${valsSql});`);
+      }
+    }
+
+    // 2. Mismatched rows -> UPDATE
+    const mismatches = tInfo.sample_mismatches || [];
+    if (mismatches.length > 0) {
+      lines.push(`\n-- Update mismatched rows (${mismatches.length} sample rows)`);
+      for (const item of mismatches) {
+        const pkDict = item.pk || {};
+        const sVals = item.source_values || {};
+        if (Object.keys(pkDict).length === 0 || Object.keys(sVals).length === 0) continue;
+
+        const setClauses = Object.entries(sVals).map(([col, val]) => `"${col}" = ${formatSqlVal(val)}`);
+        const whereClauses = Object.entries(pkDict).map(([col, val]) => `"${col}" = ${formatSqlVal(val)}`);
+        lines.push(`UPDATE "${tableName}" SET ${setClauses.join(', ')} WHERE ${whereClauses.join(' AND ')};`);
+      }
+    }
+
+    // 3. Extra rows in target (missing in source) -> DELETE commented out for safety
+    const missingSource = tInfo.sample_missing_in_source || [];
+    if (missingSource.length > 0) {
+      lines.push(`\n-- Extra rows present only in Target (${missingSource.length} sample rows)`);
+      for (const item of missingSource) {
+        const pkDict = item.pk || {};
+        if (Object.keys(pkDict).length > 0) {
+          const whereClauses = Object.entries(pkDict).map(([col, val]) => `"${col}" = ${formatSqlVal(val)}`);
+          lines.push(`-- DELETE FROM "${tableName}" WHERE ${whereClauses.join(' AND ')};`);
+        }
+      }
+    }
+
+    return lines.join('\n');
+  };
+
+  const handleCopySingleDdl = (diff: DdlDiff, idx: number) => {
+    const sql = getSingleDdlSql(diff, sourceSnap, targetSnap);
+    navigator.clipboard.writeText(sql);
+    setCopiedDdlIdx(idx);
+    setTimeout(() => setCopiedDdlIdx(null), 2000);
+  };
+
+  const handleCopyTableDataSql = (tableName: string, tInfo: any) => {
+    const sql = getTableDataSyncSql(tableName, tInfo);
+    navigator.clipboard.writeText(sql);
+    setCopiedTable(tableName);
+    setTimeout(() => setCopiedTable(null), 2000);
+  };
+
+  const handleRefreshComparison = async () => {
+    setIsRefreshing(true);
+    try {
+      const sourcePayload = await preparePayload(source);
+      const targetPayload = await preparePayload(target);
+
+      // 1. DDL comparison
+      const ddlRes = await fetch('http://localhost:8000/api/compare/ddl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: sourcePayload,
+          target: targetPayload,
+          scope: selectedObjects
+        })
+      });
+
+      if (!ddlRes.ok) {
+        const errData = await ddlRes.json().catch(() => ({}));
+        throw new Error(errData.detail || 'DDL Comparison failed');
+      }
+      const ddlData = await ddlRes.json();
+      setDiffs(ddlData.diffs || []);
+      setSourceSnap(ddlData.source_snap || null);
+      setTargetSnap(ddlData.target_snap || null);
+
+      // 2. Data comparison if enabled
+      if (compareDataEnabled && selectedDataTables.length > 0) {
+        const dataRes = await fetch('http://localhost:8000/api/compare/data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: sourcePayload,
+            target: targetPayload,
+            tables: selectedDataTables,
+            max_sample_rows: 50
+          })
+        });
+
+        if (dataRes.ok) {
+          const dataResponse = await dataRes.json();
+          setDataDiff(dataResponse.data_diff || null);
+        } else {
+          setDataDiff(null);
+        }
+      } else {
+        setDataDiff(null);
+      }
+    } catch (err) {
+      alert("Re-Comparison Error: " + err);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  const handleFetchSyncScript = async (
+    safe = syncSafeMode, 
+    withDdl = syncIncludeDdl, 
+    withData = syncIncludeData,
+    category: 'all' | 'tables' | 'views' | 'routines' | 'data' = modalCategoryFilter
+  ) => {
     setSyncLoading(true);
     try {
+      let effectiveDiffs = diffs;
+      let effectiveData = withData ? dataDiff : null;
+      let effectiveDdl = withDdl;
+      let effectiveDataFlag = withData;
+
+      if (category === 'tables') {
+        effectiveDiffs = diffs.filter(d => ['table', 'column', 'index', 'sequence'].includes(d.object_type));
+        effectiveData = null;
+        effectiveDdl = true;
+        effectiveDataFlag = false;
+      } else if (category === 'views') {
+        effectiveDiffs = diffs.filter(d => ['view', 'materialized_view'].includes(d.object_type));
+        effectiveData = null;
+        effectiveDdl = true;
+        effectiveDataFlag = false;
+      } else if (category === 'routines') {
+        effectiveDiffs = diffs.filter(d => ['function', 'procedure', 'trigger'].includes(d.object_type));
+        effectiveData = null;
+        effectiveDdl = true;
+        effectiveDataFlag = false;
+      } else if (category === 'data') {
+        effectiveDiffs = [];
+        effectiveData = dataDiff;
+        effectiveDdl = false;
+        effectiveDataFlag = true;
+      }
+
       const payload = {
         source_snap: sourceSnap,
         target_snap: targetSnap,
-        diffs: diffs,
-        data_diff: dataDiff,
+        diffs: effectiveDiffs,
+        data_diff: effectiveData,
         safe_mode: safe,
-        include_ddl: withDdl,
-        include_data: withData
+        include_ddl: effectiveDdl,
+        include_data: effectiveDataFlag
       };
 
       const [syncRes, rollbackRes] = await Promise.all([
@@ -357,7 +757,8 @@ export default function App() {
   const openSyncModal = () => {
     setIsSyncModalOpen(true);
     setActiveScriptTab('migration');
-    handleFetchSyncScript(syncSafeMode, syncIncludeDdl, syncIncludeData);
+    setModalCategoryFilter('all');
+    handleFetchSyncScript(syncSafeMode, syncIncludeDdl, syncIncludeData, 'all');
   };
 
   const handleCopyScript = () => {
@@ -368,22 +769,27 @@ export default function App() {
   };
 
   const handleDownloadMigrationScript = () => {
-    const blob = new Blob([syncScript], { type: 'text/sql;charset=utf-8;' });
+    const isMigration = activeScriptTab === 'migration';
+    const textToDownload = isMigration ? syncScript : rollbackScript;
+    const catSuffix = modalCategoryFilter !== 'all' ? `_${modalCategoryFilter}` : '';
+    const prefix = isMigration ? `forward_migration${catSuffix}` : `target_rollback${catSuffix}`;
+    const blob = new Blob([textToDownload], { type: 'text/sql;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `forward_migration_${new Date().toISOString().slice(0,10)}.sql`);
+    link.setAttribute('download', `${prefix}_${new Date().toISOString().slice(0,10)}.sql`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
   const handleDownloadRollbackScript = () => {
+    const catSuffix = modalCategoryFilter !== 'all' ? `_${modalCategoryFilter}` : '';
     const blob = new Blob([rollbackScript], { type: 'text/sql;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `target_pre_migration_backup_${new Date().toISOString().slice(0,10)}.sql`);
+    link.setAttribute('download', `target_pre_migration_backup${catSuffix}_${new Date().toISOString().slice(0,10)}.sql`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -720,7 +1126,15 @@ export default function App() {
           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
-                <h2 className="text-2xl font-bold tracking-tight text-white">Comparison Results</h2>
+                <h2 className="text-2xl font-bold tracking-tight text-white flex items-center gap-3">
+                  Comparison Results
+                  {isRefreshing && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-normal bg-orange-500/10 text-orange-400 border border-orange-500/20">
+                      <RefreshCw size={11} className="animate-spin text-orange-400" />
+                      Refreshing...
+                    </span>
+                  )}
+                </h2>
                 <div className="flex flex-wrap items-center gap-2 mt-2">
                   <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/90 border border-slate-700/80 font-mono text-xs shadow-sm">
                     <span className="text-slate-400 font-sans font-medium">Source:</span>
@@ -732,6 +1146,15 @@ export default function App() {
                 </div>
               </div>
               <div className="flex items-center gap-3">
+                <button 
+                  onClick={handleRefreshComparison}
+                  disabled={isRefreshing}
+                  className="px-3.5 py-2 rounded-xl border border-slate-700 hover:bg-slate-800 text-sm font-medium text-slate-300 hover:text-white transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  title="Re-run comparison between source and target databases"
+                >
+                  <RefreshCw size={15} className={isRefreshing ? 'animate-spin text-orange-400' : 'text-slate-400'} />
+                  {isRefreshing ? 'Re-comparing...' : 'Re-Compare'}
+                </button>
                 <button 
                   onClick={openSyncModal}
                   className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer"
@@ -832,13 +1255,14 @@ export default function App() {
                         <th className="px-4 py-3 rounded-tl-lg">Object</th>
                         <th className="px-4 py-3">Source (Actual)</th>
                         <th className="px-4 py-3">Target (Actual)</th>
-                        <th className="px-4 py-3 rounded-tr-lg">Drift Classification</th>
+                        <th className="px-4 py-3">Drift Classification</th>
+                        <th className="px-4 py-3 rounded-tr-lg text-right">Action</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-700/50">
                       {filteredDiffs.length === 0 ? (
                         <tr>
-                          <td colSpan={4} className="px-4 py-8 text-center text-slate-500 font-medium">
+                          <td colSpan={5} className="px-4 py-8 text-center text-slate-500 font-medium">
                             {diffs.length === 0 
                               ? 'No DDL differences found! Schemas are perfectly aligned.' 
                               : 'No differences match the selected filter.'}
@@ -875,6 +1299,25 @@ export default function App() {
                                   Definition Mismatch
                                 </span>
                               )}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              <button
+                                onClick={() => handleCopySingleDdl(diff, i)}
+                                className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-medium transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap shadow-sm"
+                                title="Copy SQL statement to fix this difference"
+                              >
+                                {copiedDdlIdx === i ? (
+                                  <>
+                                    <Check size={13} className="text-green-400" />
+                                    <span className="text-green-400 font-semibold">Copied!</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Copy size={13} className="text-slate-400" />
+                                    <span>Copy SQL</span>
+                                  </>
+                                )}
+                              </button>
                             </td>
                           </tr>
                         ))
@@ -969,6 +1412,29 @@ export default function App() {
                                 }`}>
                                   {isInSync ? '100% In Sync' : 'Drift Detected'}
                                 </span>
+
+                                {!isInSync && (
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      handleCopyTableDataSql(tName, tInfo);
+                                    }}
+                                    className="px-2.5 py-1 rounded-lg bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/30 text-xs font-medium transition-colors flex items-center gap-1.5 cursor-pointer shadow-sm"
+                                    title={`Copy synchronization SQL for table ${tName}`}
+                                  >
+                                    {copiedTable === tName ? (
+                                      <>
+                                        <Check size={13} className="text-green-400" />
+                                        <span className="text-green-400 font-semibold">Copied!</span>
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Copy size={13} />
+                                        <span>Copy Table SQL</span>
+                                      </>
+                                    )}
+                                  </button>
+                                )}
                               </div>
                             </div>
 
@@ -982,6 +1448,29 @@ export default function App() {
                                   </div>
                                 ) : (
                                   <div className="space-y-4">
+                                    <div className="flex flex-wrap items-center justify-between gap-2 p-3 bg-slate-800/60 border border-slate-700/80 rounded-xl">
+                                      <div>
+                                        <span className="text-slate-200 font-semibold text-xs">Table Synchronization SQL</span>
+                                        <p className="text-[11px] text-slate-400 mt-0.5">Copy individual INSERT and UPDATE statements for table &ldquo;{tName}&rdquo;</p>
+                                      </div>
+                                      <button
+                                        onClick={() => handleCopyTableDataSql(tName, tInfo)}
+                                        className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors flex items-center gap-1.5 cursor-pointer shadow-sm"
+                                      >
+                                        {copiedTable === tName ? (
+                                          <>
+                                            <Check size={14} className="text-green-300" />
+                                            <span className="font-semibold text-green-300">Copied Table SQL!</span>
+                                          </>
+                                        ) : (
+                                          <>
+                                            <Copy size={14} />
+                                            <span>Copy Table Sync SQL</span>
+                                          </>
+                                        )}
+                                      </button>
+                                    </div>
+
                                     <div className="grid grid-cols-3 gap-3">
                                       <div className="p-3 rounded-lg bg-slate-800/60 border border-slate-700">
                                         <span className="text-slate-400">Missing in Target:</span>
@@ -1060,47 +1549,80 @@ export default function App() {
             <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
               
               {/* Modal Header */}
-              <div className="p-6 border-b border-slate-800 flex items-center justify-between">
+              <div className="p-5 border-b border-slate-800 flex items-center justify-between">
                 <div>
-                  <h3 className="text-xl font-bold text-slate-100 flex items-center gap-2">
-                    <FileText size={20} className="text-orange-400" />
-                    Migration & Pre-Migration Rollback Scripts
+                  <h3 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+                    <FileText size={18} className="text-orange-400" />
+                    Generated Synchronization Script
                   </h3>
-                  <p className="text-xs text-slate-400 mt-1">
-                    Auto-generated forward sync script and inverse target rollback script for safe, zero-risk migrations.
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Review and export migration statements or rollback backup to restore Target state.
                   </p>
                 </div>
                 <button 
                   onClick={() => setIsSyncModalOpen(false)}
-                  className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+                  className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition-colors cursor-pointer"
                 >
-                  <XCircle size={20} />
+                  <XCircle size={18} />
                 </button>
               </div>
 
-              {/* Safety Recommendation Banner */}
-              <div className="mx-6 mt-4 p-3.5 bg-emerald-950/40 border border-emerald-500/40 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-inner">
-                <div className="flex items-center gap-2.5 text-emerald-200">
-                  <ShieldCheck size={20} className="text-emerald-400 shrink-0" />
-                  <div>
-                    <span className="font-semibold text-emerald-300">Safety Recommendation: Pre-Migration Backup Ready</span>
-                    <p className="text-[11px] text-emerald-400/80 mt-0.5">
-                      Download the Target Rollback Script before executing forward changes in Production to restore previous schema and row data if needed.
-                    </p>
-                  </div>
+              {/* Options & Tab Controls */}
+              <div className="px-6 py-3 bg-slate-800/40 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs">
+                {/* Script Switcher */}
+                <div className="flex items-center bg-slate-900/90 p-1 rounded-xl border border-slate-700/60">
+                  <button
+                    onClick={() => setActiveScriptTab('migration')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                      activeScriptTab === 'migration'
+                        ? 'bg-orange-600 text-white shadow-sm font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <FileText size={13} />
+                    Migration Script
+                  </button>
+                  <button
+                    onClick={() => setActiveScriptTab('rollback')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer flex items-center gap-1.5 ${
+                      activeScriptTab === 'rollback'
+                        ? 'bg-emerald-600 text-white shadow-sm font-semibold'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    <Undo2 size={13} />
+                    Rollback Script
+                  </button>
                 </div>
-                <button
-                  onClick={handleDownloadRollbackScript}
-                  disabled={syncLoading || !rollbackScript}
-                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg flex items-center justify-center gap-1.5 shrink-0 transition-all shadow-md shadow-emerald-900/30 cursor-pointer disabled:opacity-50"
-                >
-                  <Download size={14} />
-                  Download Rollback (.sql)
-                </button>
-              </div>
 
-              {/* Modal Options Bar */}
-              <div className="px-6 py-3 bg-slate-800/40 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs mt-3">
+                {/* Scope / Category Selector */}
+                <div className="flex items-center bg-slate-900/90 p-1 rounded-xl border border-slate-700/60 gap-1">
+                  {[
+                    { key: 'all', label: 'All Objects' },
+                    { key: 'tables', label: 'Tables Only' },
+                    { key: 'views', label: 'Views Only' },
+                    { key: 'routines', label: 'Routines Only' },
+                    { key: 'data', label: 'Data Drift Only' }
+                  ].map(cat => (
+                    <button
+                      key={cat.key}
+                      onClick={() => {
+                        const newCat = cat.key as 'all' | 'tables' | 'views' | 'routines' | 'data';
+                        setModalCategoryFilter(newCat);
+                        handleFetchSyncScript(syncSafeMode, syncIncludeDdl, syncIncludeData, newCat);
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+                        modalCategoryFilter === cat.key
+                          ? 'bg-slate-700 text-white shadow-sm font-semibold'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {cat.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Filters */}
                 <div className="flex items-center gap-4">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input 
@@ -1109,117 +1631,70 @@ export default function App() {
                       onChange={e => {
                         const val = e.target.checked;
                         setSyncSafeMode(val);
-                        handleFetchSyncScript(val, syncIncludeDdl, syncIncludeData);
+                        handleFetchSyncScript(val, syncIncludeDdl, syncIncludeData, modalCategoryFilter);
                       }}
-                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
+                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700 cursor-pointer"
                     />
                     <span className="font-medium text-slate-200 flex items-center gap-1">
                       <Shield size={14} className={syncSafeMode ? 'text-green-400' : 'text-slate-500'} />
-                      Safe Mode (Comment Destructive Drops)
+                      Safe Mode
                     </span>
                   </label>
 
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input 
-                      type="checkbox" 
-                      checked={syncIncludeDdl} 
-                      onChange={e => {
-                        const val = e.target.checked;
-                        setSyncIncludeDdl(val);
-                        handleFetchSyncScript(syncSafeMode, val, syncIncludeData);
-                      }}
-                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
-                    />
-                    <span className="text-slate-300">DDL Statements</span>
-                  </label>
+                  {modalCategoryFilter === 'all' && (
+                    <>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input 
+                          type="checkbox" 
+                          checked={syncIncludeDdl} 
+                          onChange={e => {
+                            const val = e.target.checked;
+                            setSyncIncludeDdl(val);
+                            handleFetchSyncScript(syncSafeMode, val, syncIncludeData, modalCategoryFilter);
+                          }}
+                          className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700 cursor-pointer"
+                        />
+                        <span className="text-slate-300">DDL</span>
+                      </label>
 
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input 
-                      type="checkbox" 
-                      checked={syncIncludeData} 
-                      onChange={e => {
-                        const val = e.target.checked;
-                        setSyncIncludeData(val);
-                        handleFetchSyncScript(syncSafeMode, syncIncludeDdl, val);
-                      }}
-                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
-                    />
-                    <span className="text-slate-300">Data Sync</span>
-                  </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input 
+                          type="checkbox" 
+                          checked={syncIncludeData} 
+                          onChange={e => {
+                            const val = e.target.checked;
+                            setSyncIncludeData(val);
+                            handleFetchSyncScript(syncSafeMode, syncIncludeDdl, val, modalCategoryFilter);
+                          }}
+                          className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700 cursor-pointer"
+                        />
+                        <span className="text-slate-300">Data</span>
+                      </label>
+                    </>
+                  )}
                 </div>
 
-                <div className="flex items-center gap-3 text-slate-400 font-mono text-[11px]">
-                  <span>Migration: <strong className="text-orange-400">{syncStats?.statements_count ?? 0}</strong> stmts</span>
-                  <span className="text-slate-600">|</span>
-                  <span>Rollback: <strong className="text-emerald-400">{rollbackStats?.statements_count ?? 0}</strong> stmts</span>
+                <div className="font-mono text-slate-400 text-[11px]">
+                  Statements: <strong className={activeScriptTab === 'migration' ? 'text-orange-400' : 'text-emerald-400'}>
+                    {activeScriptTab === 'migration' ? (syncStats?.statements_count ?? 0) : (rollbackStats?.statements_count ?? 0)}
+                  </strong>
                 </div>
-              </div>
-
-              {/* Script Tab Switcher */}
-              <div className="px-6 pt-3 flex items-center justify-between border-b border-slate-800 bg-slate-900">
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setActiveScriptTab('migration')}
-                    className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-all border-b-2 cursor-pointer flex items-center gap-2 ${
-                      activeScriptTab === 'migration'
-                        ? 'text-orange-400 border-orange-500 bg-slate-800/60 font-semibold'
-                        : 'text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/30'
-                    }`}
-                  >
-                    <FileText size={14} />
-                    Forward Migration Script
-                    {syncStats && (
-                      <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-orange-500/20 text-orange-300 border border-orange-500/30">
-                        {syncStats.statements_count} stmts
-                      </span>
-                    )}
-                  </button>
-
-                  <button
-                    onClick={() => setActiveScriptTab('rollback')}
-                    className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-all border-b-2 cursor-pointer flex items-center gap-2 ${
-                      activeScriptTab === 'rollback'
-                        ? 'text-emerald-400 border-emerald-500 bg-slate-800/60 font-semibold'
-                        : 'text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/30'
-                    }`}
-                  >
-                    <Undo2 size={14} />
-                    Target Pre-Migration Rollback Script
-                    {rollbackStats && (
-                      <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                        {rollbackStats.statements_count} stmts
-                      </span>
-                    )}
-                  </button>
-                </div>
-
-                <span className="text-[11px] text-slate-500 font-mono hidden sm:inline">
-                  {activeScriptTab === 'migration' ? 'Target → Source Parity' : 'Target → Restore Original State'}
-                </span>
               </div>
 
               {/* Code viewer */}
-              <div className="flex-1 p-6 overflow-y-auto">
+              <div className="flex-1 p-5 overflow-y-auto">
                 {syncLoading ? (
                   <div className="h-64 flex flex-col items-center justify-center space-y-3">
-                    <Loader2 size={28} className="animate-spin text-orange-500" />
-                    <p className="text-sm text-slate-400">Synthesizing PostgreSQL migration and rollback scripts...</p>
+                    <Loader2 size={26} className="animate-spin text-orange-500" />
+                    <p className="text-xs text-slate-400">Synthesizing SQL script...</p>
                   </div>
                 ) : (
                   <div className="relative">
-                    <div className="flex items-center justify-between px-4 py-2.5 bg-slate-950 border border-b-0 border-slate-800 rounded-t-xl text-xs text-slate-400">
-                      <span className="font-mono text-slate-300">
-                        {activeScriptTab === 'migration' ? 'Forward Migration Script' : 'Target Rollback Script'} ({(activeScriptTab === 'migration' ? syncScript : rollbackScript).split('\n').length} lines)
-                      </span>
-                      <button
-                        onClick={handleCopyScript}
-                        className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-all cursor-pointer"
-                      >
-                        {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
-                        {copied ? 'Copied to Clipboard!' : `Copy ${activeScriptTab === 'migration' ? 'Migration' : 'Rollback'}`}
-                      </button>
+                    <div className="px-4 py-2 bg-slate-950 border border-b-0 border-slate-800 rounded-t-xl text-xs text-slate-400 font-mono flex items-center justify-between">
+                      <span className="text-slate-300">{activeScriptTab === 'migration' ? 'forward_migration.sql' : 'target_rollback_backup.sql'} ({(activeScriptTab === 'migration' ? syncScript : rollbackScript).split('\n').length} lines)</span>
+                      <span className="text-[11px] text-slate-500">{activeScriptTab === 'migration' ? 'Target → Source Parity' : 'Target → Restore Original State'}</span>
                     </div>
-                    <pre className="p-4 bg-slate-950 rounded-b-xl border border-slate-800 text-xs font-mono text-slate-200 overflow-x-auto leading-relaxed select-all max-h-[50vh]">
+                    <pre className="p-4 bg-slate-950 rounded-b-xl border border-slate-800 text-xs font-mono text-slate-200 overflow-x-auto leading-relaxed select-all max-h-[52vh]">
                       {activeScriptTab === 'migration' ? syncScript : rollbackScript}
                     </pre>
                   </div>
@@ -1227,39 +1702,39 @@ export default function App() {
               </div>
 
               {/* Modal Footer */}
-              <div className="p-6 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 bg-slate-900/50">
+              <div className="p-5 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 bg-slate-900/50">
                 <p className="text-xs text-slate-500 flex items-center gap-1.5">
                   <Shield size={14} className="text-green-400" />
-                  Both scripts run inside atomic transactions (<code className="text-slate-400">BEGIN; ... COMMIT;</code>)
+                  Atomic transaction (<code className="text-slate-400">BEGIN; ... COMMIT;</code>)
                 </p>
 
                 <div className="flex items-center gap-3">
                   <button
                     onClick={handleCopyScript}
                     disabled={syncLoading || !(activeScriptTab === 'migration' ? syncScript : rollbackScript)}
-                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium rounded-xl border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-xl border border-slate-700 transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                   >
-                    {copied ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
-                    {copied ? 'Copied' : 'Copy Active SQL'}
+                    {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                    {copied ? 'Copied!' : 'Copy SQL'}
                   </button>
 
                   <button
                     onClick={handleDownloadRollbackScript}
                     disabled={syncLoading || !rollbackScript}
-                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium rounded-xl shadow-lg shadow-emerald-700/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
-                    title="Download safety rollback script to revert Target changes"
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 hover:border-emerald-500/50 text-xs font-medium rounded-xl transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    title="Download safety rollback backup script for Target"
                   >
-                    <Download size={16} />
+                    <Undo2 size={14} />
                     Download Rollback (.sql)
                   </button>
 
                   <button
                     onClick={handleDownloadMigrationScript}
                     disabled={syncLoading || !syncScript}
-                    className="px-5 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    className="px-5 py-2 bg-orange-600 hover:bg-orange-500 text-white text-xs font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                     title="Download forward migration script"
                   >
-                    <Download size={16} />
+                    <Download size={14} />
                     Download Migration (.sql)
                   </button>
                 </div>

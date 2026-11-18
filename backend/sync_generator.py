@@ -1,5 +1,6 @@
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 def quote_ident(ident: str) -> str:
     """Safely quote a SQL identifier."""
@@ -16,6 +17,34 @@ def format_val(val: Any) -> str:
         return str(val)
     s = str(val).replace("'", "''")
     return f"'{s}'"
+
+def extract_sequences_from_columns(cols: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """
+    Returns list of (seq_name, col_name) for any nextval references in column defaults.
+    e.g. nextval('order_id_seq'::regclass) -> ('order_id_seq', 'id')
+    """
+    seqs = []
+    for c_name, c_data in cols.items():
+        default_val = c_data.get('default') or ''
+        m = re.search(r"nextval\('(?:\w+\.)?\"?([a-zA-Z0-9_]+)\"?'(?:::regclass)?\)", default_val, re.IGNORECASE)
+        if m:
+            seq_name = m.group(1)
+            seqs.append((seq_name, c_name))
+    return seqs
+
+def ensure_index_if_not_exists(idx_def: str) -> str:
+    """Ensure CREATE [UNIQUE] INDEX includes IF NOT EXISTS."""
+    clean = idx_def.strip()
+    if not clean.endswith(';'):
+        clean += ';'
+    if "IF NOT EXISTS" not in clean.upper():
+        clean = re.sub(
+            r'^(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+',
+            r'\1 IF NOT EXISTS ',
+            clean,
+            flags=re.IGNORECASE
+        )
+    return clean
 
 def generate_ddl_sync_script(
     source_snap: Dict[str, Any],
@@ -62,11 +91,14 @@ def generate_ddl_sync_script(
 
     # 2. Sequences
     seq_lines = []
+    created_seqs = set()
     for d in diffs:
         if d.get('object_type') == 'sequence':
             name = d.get('name')
             if d.get('status') == 'missing_target':
-                seq_lines.append(f"CREATE SEQUENCE IF NOT EXISTS {quote_ident(name)};")
+                if name not in created_seqs:
+                    seq_lines.append(f"CREATE SEQUENCE IF NOT EXISTS {quote_ident(name)};")
+                    created_seqs.add(name)
             elif d.get('status') == 'missing_source':
                 if safe_mode:
                     seq_lines.append(f"-- [TARGET ONLY SEQUENCE] Extra sequence: {name}")
@@ -91,6 +123,13 @@ def generate_ddl_sync_script(
                 cols = t_info.get('columns', {})
                 pks = t_info.get('primary_keys', [])
                 
+                # Auto-create any referenced sequences BEFORE the table so regclass resolves
+                referenced_seqs = extract_sequences_from_columns(cols)
+                for seq_name, col_name in referenced_seqs:
+                    if seq_name not in created_seqs:
+                        table_lines.append(f"CREATE SEQUENCE IF NOT EXISTS {quote_ident(seq_name)};")
+                        created_seqs.add(seq_name)
+                
                 col_defs = []
                 for c_name, c_data in cols.items():
                     col_str = f"    {quote_ident(c_name)} {c_data['type']}"
@@ -106,6 +145,9 @@ def generate_ddl_sync_script(
                     
                 body = ",\n".join(col_defs)
                 table_lines.append(f"CREATE TABLE IF NOT EXISTS {quote_ident(t_name)} (\n{body}\n);")
+                
+                for seq_name, col_name in referenced_seqs:
+                    table_lines.append(f"ALTER SEQUENCE {quote_ident(seq_name)} OWNED BY {quote_ident(t_name)}.{quote_ident(col_name)};")
             elif d.get('status') == 'missing_source':
                 if safe_mode:
                     table_lines.append(f"-- [TARGET ONLY TABLE] '{t_name}' does not exist in Source.")
@@ -133,6 +175,13 @@ def generate_ddl_sync_script(
                 if status == 'missing_target':
                     col_data = raw.get('col_data') or source_tables.get(t_name, {}).get('columns', {}).get(c_name, {})
                     type_str = col_data.get('type', 'text')
+                    default_str = col_data.get('default') or ''
+                    m_seq = re.search(r"nextval\('(?:\w+\.)?\"?([a-zA-Z0-9_]+)\"?'(?:::regclass)?\)", default_str, re.IGNORECASE)
+                    if m_seq:
+                        seq_name = m_seq.group(1)
+                        if seq_name not in created_seqs:
+                            col_lines.append(f"CREATE SEQUENCE IF NOT EXISTS {quote_ident(seq_name)};")
+                            created_seqs.add(seq_name)
                     stmt = f"ALTER TABLE {quote_ident(t_name)} ADD COLUMN IF NOT EXISTS {quote_ident(c_name)} {type_str}"
                     if col_data.get('default'):
                         stmt += f" DEFAULT {col_data['default']}"
@@ -140,6 +189,8 @@ def generate_ddl_sync_script(
                         stmt += " NOT NULL"
                     stmt += ";"
                     col_lines.append(stmt)
+                    if m_seq:
+                        col_lines.append(f"ALTER SEQUENCE {quote_ident(m_seq.group(1))} OWNED BY {quote_ident(t_name)}.{quote_ident(c_name)};")
                     
                 elif status == 'missing_source':
                     if safe_mode:
@@ -182,27 +233,24 @@ def generate_ddl_sync_script(
             t_indexes = source_tables.get(t_name, {}).get('indexes', {})
             t_pks = source_tables.get(t_name, {}).get('primary_keys', [])
             for i_name, i_def in t_indexes.items():
-                if i_name.endswith('_pkey') or any(i_name == f"{t_name}_{pk}_key" for pk in t_pks):
+                if i_name.endswith('_pkey') or i_name == f"{t_name}_pkey" or any(i_name == f"{t_name}_{pk}_key" for pk in t_pks):
                     continue
                 if i_def:
-                    clean_def = i_def.strip()
-                    if not clean_def.endswith(';'):
-                        clean_def += ';'
-                    idx_lines.append(clean_def)
+                    idx_lines.append(ensure_index_if_not_exists(i_def))
 
     for d in diffs:
         if d.get('object_type') == 'index':
             name_parts = d.get('name', '').split('.')
             idx_name = name_parts[1] if len(name_parts) == 2 else d.get('name')
+            if idx_name.endswith('_pkey'):
+                continue
             status = d.get('status')
             raw = d.get('raw_data', {})
             
             if status == 'missing_target':
                 idx_def = raw.get('def', '')
                 if idx_def:
-                    if not idx_def.strip().endswith(';'):
-                        idx_def = idx_def.strip() + ';'
-                    idx_lines.append(idx_def)
+                    idx_lines.append(ensure_index_if_not_exists(idx_def))
             elif status == 'missing_source':
                 if safe_mode:
                     idx_lines.append(f"-- [TARGET ONLY INDEX] '{idx_name}' does not exist in Source.")
@@ -213,9 +261,7 @@ def generate_ddl_sync_script(
                 idx_lines.append(f"DROP INDEX IF EXISTS {quote_ident(idx_name)};")
                 s_def = raw.get('source_def', '')
                 if s_def:
-                    if not s_def.strip().endswith(';'):
-                        s_def = s_def.strip() + ';'
-                    idx_lines.append(s_def)
+                    idx_lines.append(ensure_index_if_not_exists(s_def))
     if idx_lines:
         lines.append("-- ===========================================")
         lines.append("-- 5. INDEXES")
@@ -680,6 +726,8 @@ def generate_ddl_rollback_script(
         if d.get('object_type') == 'index':
             name_parts = d.get('name', '').split('.')
             idx_name = name_parts[1] if len(name_parts) == 2 else d.get('name')
+            if idx_name.endswith('_pkey'):
+                continue
             status = d.get('status')
             raw = d.get('raw_data', {})
             t_name = raw.get('table') or (name_parts[0] if len(name_parts) == 2 else None)
@@ -687,8 +735,7 @@ def generate_ddl_rollback_script(
                 idx_lines.append(f"DROP INDEX IF EXISTS {quote_ident(idx_name)};")
                 t_def = raw.get('target_def', '')
                 if t_def:
-                    if not t_def.strip().endswith(';'): t_def += ';'
-                    idx_lines.append(t_def)
+                    idx_lines.append(ensure_index_if_not_exists(t_def))
             elif status == 'missing_target':
                 idx_lines.append(f"-- [FORWARD CREATED INDEX] Revert by dropping index:")
                 idx_lines.append(f"-- DROP INDEX IF EXISTS {quote_ident(idx_name)};")
