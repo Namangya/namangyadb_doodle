@@ -1,55 +1,85 @@
 <div align="center">
   <img src="https://img.icons8.com/color/96/000000/database-restore.png" width="80" alt="NamangyaDB Logo"/>
   <h1>NamangyaDB Compare</h1>
-  <p><b>A modern, zero-retention database schema and data migration utility.</b></p>
+  <p><b>An enterprise-grade, zero-retention database schema and data migration utility.</b></p>
   
   [![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](#)
   [![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](#)
   [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)](#)
+  [![Zero Retention](https://img.shields.io/badge/Security-Zero--Retention-green?style=for-the-badge&logo=shield)](#)
 </div>
 
 <br />
 
 ## 🌟 Overview
 
-NamangyaDB Compare is an enterprise-grade utility designed to effortlessly identify Data Definition Language (DDL) drift and data inconsistencies between any two database environments (Source vs Target).
+NamangyaDB Compare is a production-ready utility designed to identify Data Definition Language (DDL) drift and row-level data inconsistencies between any two database environments (**Source** vs **Target**).
 
-Built for security-conscious organizations, NamangyaDB operates completely in-memory utilizing a strict **Zero-Retention Policy**. No credentials, identity files, or schemas are ever written to disk.
+Built for security-conscious organizations, NamangyaDB operates completely in-memory with a strict **Zero-Retention Policy**. No credentials, SSH private keys, schemas, or row data are ever persisted to disk.
 
-## ✨ Key Features
+---
 
-- **Multi-Cloud Support**: Natively connects to AWS RDS, Azure Database, Oracle Cloud, Supabase, and local infrastructure.
-- **Direct & Secure SSH Tunnels**: Built-in support for secure bastion hosts via `.pem` identity files.
-- **Structured Diffing**: Highlights exact missing columns, indexes, and type mismatches.
-- **Zero-Retention Security**: Absolute guarantee that no sensitive connection data is persisted. 
+## ✨ Supported DDL Schema Objects
 
-## 🏗 Architecture
+NamangyaDB provides comprehensive inspection, delta diffing, and migration script generation across all major PostgreSQL schema objects:
 
-The platform is decoupled into a lightning-fast React frontend and a highly concurrent Python backend:
+| Object Type             | Description                  | Granular Inspection Attributes                                                                 |
+| ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| **Tables**              | Relational tables            | Column definitions, data types, nullability, defaults, primary keys                            |
+| **Indexes**             | Secondary indexes            | Unique constraints, index expressions, multi-column definitions                                |
+| **Views**               | Standard SQL views           | Complete view query definitions, dependency order                                              |
+| **Materialized Views**  | Cached query results         | Separate from standard views; definitions and refresh settings                                 |
+| **Stored Procedures**   | Procedural routines          | Distinguished from functions via PostgreSQL `prokind = 'p'`                                    |
+| **Functions**           | Scalar and trigger functions | Signature parameters, return types, routine body definitions (`prokind = 'f'`)                 |
+| **Sequences**           | Auto-increment generators    | Existence, names, and state tracking                                                           |
+| **Triggers**            | Event triggers               | Associated tables, events (BEFORE/AFTER), firing conditions                                    |
+| **Roles & Users**       | Database roles and accounts  | Login capability, superuser, inherit, create role, create DB, connection limits                |
+| **Grants & Privileges** | Access control permissions   | Table privileges (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`) |
 
-- **Frontend**: React (Vite) + Tailwind CSS (Orangish/Dark Theme)
-- **Backend**: Python FastAPI + `psycopg2` + `sshtunnel`
+---
 
-## 🚀 Progress & Roadmap
+## 🔒 Enterprise Security & Architecture
 
-We are developing NamangyaDB iteratively. Current progress:
+- **Strict Zero-Retention**: All connection configurations, credentials, and uploaded SSH `.pem` identity keys are held exclusively in RAM and discarded immediately after use.
+- **Credential Sanitization**: Backend error handlers intercept exceptions and strip database passwords and connection strings before returning responses to clients.
+- **Configurable CORS**: Supports environment-configurable origin whitelisting (`ALLOWED_ORIGINS`) to prevent unauthorized cross-origin requests.
+- **Safe Mode Migrations**: Generated synchronization scripts comment out destructive operations (`DROP COLUMN`, `DROP TABLE`, `DROP ROLE`, `DELETE`) by default with explicit review markers.
+- **Transactional Execution**: All generated sync scripts are wrapped in atomic transaction blocks (`BEGIN; ... COMMIT;`).
 
-- [x] **Phase 1: Basic UI Shell & Configuration**
-  - Modern, responsive React interface.
-  - Legal, About, and robust Validation features built-in.
-- [x] **Phase 2: Core Connectivity & Privacy Engine**
-  - FastAPI backend configured with `sshtunnel`.
-  - Zero-retention memory management for `.pem` files.
-- [ ] **Phase 3: DDL Comparison Engine** *(Up Next)*
-  - Extract structural metadata (Tables, Columns, Indexes).
-  - Compute exact delta algorithms.
-- [ ] **Phase 4: Data Comparison Engine**
-  - Row-level analysis and MD5 hashing for large tables.
-- [ ] **Phase 5: Sync Script Generation**
-  - Auto-generate `ALTER` / `CREATE` SQL statements.
+---
+
+## 🛠 Quickstart Guide
+
+### 1. Start the Backend API
+
+```bash
+cd backend
+source venv/bin/activate
+pip install -r requirements.txt
+python main.py
+```
+
+Backend runs at `http://127.0.0.1:8000`.
+
+### 2. Start the Frontend UI
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Frontend runs at `http://127.0.0.1:5173`.
+
+### 3. Production Build
+
+```bash
+cd frontend
+npm run build
+```
 
 ---
 
 <div align="center">
-  <i>Engineered for the Modern Cloud Architecture</i>
+  <i>Engineered for Enterprise Database Reliability & Security</i>
 </div>

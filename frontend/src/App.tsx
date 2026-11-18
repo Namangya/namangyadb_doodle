@@ -1,5 +1,9 @@
 import { useState } from 'react';
-import { Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, CheckCircle2, XCircle, TerminalSquare, Clock, Filter } from 'lucide-react';
+import { 
+  Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, 
+  CheckCircle2, XCircle, TerminalSquare, Clock, Filter, Copy, Check, Download, 
+  Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2
+} from 'lucide-react';
 
 type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
 type ConnectionMethod = 'direct' | 'ssh';
@@ -37,32 +41,113 @@ const getEmptyState = (provider: ProviderType = 'aws'): ConnectionState => ({
 });
 
 interface PreFlightData {
-  source_counts: Record<string, number>;
-  target_counts: Record<string, number>;
+  source_counts: Record<string, any>;
+  target_counts: Record<string, any>;
+  common_tables: string[];
   eta_seconds: number;
   total_objects: number;
 }
+
+interface DdlDiff {
+  object_type: string;
+  name: string;
+  object: string;
+  source_actual: string;
+  target_actual: string;
+  status: 'missing_target' | 'missing_source' | 'mismatch';
+  raw_data?: Record<string, any>;
+}
+
+interface DataDiffSummary {
+  tables_analyzed: number;
+  tables_in_sync: number;
+  tables_with_drift: number;
+  total_missing_target: number;
+  total_missing_source: number;
+  total_value_mismatches: number;
+}
+
+interface TableDataDiff {
+  table_name: string;
+  status: 'in_sync' | 'drift_detected' | 'error';
+  source_row_count: number;
+  target_row_count: number;
+  source_checksum: string;
+  target_checksum: string;
+  primary_keys: string[];
+  common_columns: string[];
+  missing_in_target_count: number;
+  missing_in_source_count: number;
+  mismatched_rows_count: number;
+  sample_missing_in_target: any[];
+  sample_missing_in_source: any[];
+  sample_mismatches: any[];
+  error?: string;
+}
+
+interface DataDiffResult {
+  summary: DataDiffSummary;
+  tables: Record<string, TableDataDiff>;
+}
+
+const SCHEMA_OBJECTS = [
+  { key: 'tables', label: 'Tables & Columns', desc: 'Columns, data types, defaults, nullability, constraints, indexes' },
+  { key: 'views', label: 'Standard Views', desc: 'Standard SQL view definitions' },
+  { key: 'materialized_views', label: 'Materialized Views', desc: 'Precomputed cached query view definitions' },
+  { key: 'functions', label: 'Functions', desc: 'Scalar & table functions (LANGUAGE plpgsql/sql)' },
+  { key: 'procedures', label: 'Stored Procedures', desc: 'Transactional stored procedures (CALL ...)' },
+  { key: 'sequences', label: 'Sequences', desc: 'Auto-increment and identity sequences' },
+  { key: 'triggers', label: 'Triggers', desc: 'Row and statement event triggers' },
+  { key: 'roles', label: 'Users & Roles', desc: 'Database users, login attributes & permissions' },
+  { key: 'grants', label: 'Grants & Privileges', desc: 'Object privileges (SELECT, INSERT, UPDATE, EXECUTE)' },
+];
 
 export default function App() {
   const [zeroRetention, setZeroRetention] = useState(true);
   const [view, setView] = useState<ViewState>('setup');
 
-  const [source, setSource] = useState<ConnectionState>(getEmptyState('aws'));
-  const [target, setTarget] = useState<ConnectionState>(getEmptyState('supabase'));
+  const [source, setSource] = useState<ConnectionState>(getEmptyState('local'));
+  const [target, setTarget] = useState<ConnectionState>(getEmptyState('local'));
   
   const [isPreflightLoading, setIsPreflightLoading] = useState(false);
   const [preflightData, setPreflightData] = useState<PreFlightData | null>(null);
-  const [diffs, setDiffs] = useState<any[]>([]);
   
+  // Scope controls (Complete DDL Schema Types)
   const [selectedObjects, setSelectedObjects] = useState<Record<string, boolean>>({
     tables: true,
     views: true,
+    materialized_views: true,
     functions: true,
+    procedures: true,
     sequences: true,
-    triggers: true
+    triggers: true,
+    roles: true,
+    grants: true
   });
+  const [compareDataEnabled, setCompareDataEnabled] = useState(true);
+  const [selectedDataTables, setSelectedDataTables] = useState<string[]>([]);
+
+  // Comparison results
+  const [diffs, setDiffs] = useState<DdlDiff[]>([]);
+  const [sourceSnap, setSourceSnap] = useState<any>(null);
+  const [targetSnap, setTargetSnap] = useState<any>(null);
+  const [dataDiff, setDataDiff] = useState<DataDiffResult | null>(null);
+  const [activeResultTab, setActiveResultTab] = useState<'ddl' | 'data'>('ddl');
+  const [ddlFilter, setDdlFilter] = useState<string>('all');
+  const [expandedTables, setExpandedTables] = useState<Record<string, boolean>>({});
+
+  // Sync Script modal
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [syncScript, setSyncScript] = useState('');
+  const [syncStats, setSyncStats] = useState<any>(null);
+  const [syncSafeMode, setSyncSafeMode] = useState(true);
+  const [syncIncludeDdl, setSyncIncludeDdl] = useState(true);
+  const [syncIncludeData, setSyncIncludeData] = useState(true);
+  const [copied, setCopied] = useState(false);
 
   const canCompare = source.testStatus === 'success' && target.testStatus === 'success';
+  const [isTestingBoth, setIsTestingBoth] = useState(false);
 
   const preparePayload = async (data: ConnectionState) => {
     let pemText = '';
@@ -83,6 +168,38 @@ export default function App() {
     };
   };
 
+  const testOneConnection = async (data: ConnectionState, setData: (d: ConnectionState) => void) => {
+    setData({ ...data, testStatus: 'testing_db' });
+    try {
+      const payload = await preparePayload(data);
+      const res = await fetch('http://localhost:8000/api/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || 'Connection failed');
+      }
+      setData({ ...data, testStatus: 'success' });
+    } catch (err) {
+      console.error("Test connection error:", err);
+      setData({ ...data, testStatus: 'error' });
+    }
+  };
+
+  const handleTestBoth = async () => {
+    setIsTestingBoth(true);
+    try {
+      await Promise.all([
+        testOneConnection(source, setSource),
+        testOneConnection(target, setTarget)
+      ]);
+    } finally {
+      setIsTestingBoth(false);
+    }
+  };
+
   const handlePreflight = async () => {
     if (!canCompare) return;
     setIsPreflightLoading(true);
@@ -100,9 +217,13 @@ export default function App() {
         })
       });
       
-      if (!res.ok) throw new Error('Failed to fetch preflight counts');
-      const data = await res.json();
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Failed to fetch preflight counts');
+      }
+      const data: PreFlightData = await res.json();
       setPreflightData(data);
+      setSelectedDataTables(data.common_tables || []);
       setView('preflight');
     } catch (err) {
       alert("Failed to run preflight check: " + err);
@@ -118,7 +239,8 @@ export default function App() {
       const sourcePayload = await preparePayload(source);
       const targetPayload = await preparePayload(target);
       
-      const res = await fetch('http://localhost:8000/api/compare/ddl', {
+      // 1. Run DDL comparison
+      const ddlRes = await fetch('http://localhost:8000/api/compare/ddl', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -128,10 +250,41 @@ export default function App() {
         })
       });
       
-      if (!res.ok) throw new Error('Comparison failed');
-      const data = await res.json();
-      setDiffs(data.diffs);
+      if (!ddlRes.ok) {
+        const errData = await ddlRes.json().catch(() => ({}));
+        throw new Error(errData.detail || 'DDL Comparison failed');
+      }
+      const ddlData = await ddlRes.json();
+      setDiffs(ddlData.diffs || []);
+      setSourceSnap(ddlData.source_snap || null);
+      setTargetSnap(ddlData.target_snap || null);
+
+      // 2. Run Data comparison if enabled
+      if (compareDataEnabled && selectedDataTables.length > 0) {
+        const dataRes = await fetch('http://localhost:8000/api/compare/data', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            source: sourcePayload,
+            target: targetPayload,
+            tables: selectedDataTables,
+            max_sample_rows: 50
+          })
+        });
+
+        if (dataRes.ok) {
+          const dataResponse = await dataRes.json();
+          setDataDiff(dataResponse.data_diff || null);
+        } else {
+          console.warn("Data comparison returned error");
+          setDataDiff(null);
+        }
+      } else {
+        setDataDiff(null);
+      }
+
       setView('results');
+      setActiveResultTab('ddl');
     } catch (err) {
       alert("Comparison Error: " + err);
       setView('preflight');
@@ -146,10 +299,75 @@ export default function App() {
         objects += (preflightData.source_counts[key] || 0) + (preflightData.target_counts[key] || 0);
       }
     }
-    return Math.max(1, Math.floor(objects * 0.05));
+    let sec = Math.max(1, Math.floor(objects * 0.05));
+    if (compareDataEnabled && selectedDataTables.length > 0) {
+      sec += Math.max(1, Math.ceil(selectedDataTables.length * 0.4));
+    }
+    return sec;
   };
   
   const dynamicEta = calculateDynamicEta();
+
+  const handleFetchSyncScript = async (safe = syncSafeMode, withDdl = syncIncludeDdl, withData = syncIncludeData) => {
+    setSyncLoading(true);
+    try {
+      const res = await fetch('http://localhost:8000/api/generate-sync-script', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source_snap: sourceSnap,
+          target_snap: targetSnap,
+          diffs: diffs,
+          data_diff: dataDiff,
+          safe_mode: safe,
+          include_ddl: withDdl,
+          include_data: withData
+        })
+      });
+      if (!res.ok) throw new Error("Failed to generate sync script");
+      const data = await res.json();
+      setSyncScript(data.sql);
+      setSyncStats(data.stats);
+    } catch (e) {
+      alert("Error generating script: " + e);
+    } finally {
+      setSyncLoading(false);
+    }
+  };
+
+  const openSyncModal = () => {
+    setIsSyncModalOpen(true);
+    handleFetchSyncScript(syncSafeMode, syncIncludeDdl, syncIncludeData);
+  };
+
+  const handleCopyScript = () => {
+    navigator.clipboard.writeText(syncScript);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleDownloadScript = () => {
+    const blob = new Blob([syncScript], { type: 'text/sql;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `namangya_sync_${new Date().toISOString().slice(0,10)}.sql`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const filteredDiffs = diffs.filter(d => {
+    if (ddlFilter === 'all') return true;
+    return d.object_type === ddlFilter;
+  });
+
+  const toggleTableExpand = (tableName: string) => {
+    setExpandedTables(prev => ({
+      ...prev,
+      [tableName]: !prev[tableName]
+    }));
+  };
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 font-sans selection:bg-orange-500/30 flex flex-col">
@@ -179,7 +397,7 @@ export default function App() {
               <div className="absolute right-0 top-full mt-2 w-64 p-3 bg-slate-800 border border-slate-700 rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all z-50 text-xs text-slate-300">
                 <p className="mb-1 text-slate-100 font-medium">Zero-Retention Mode</p>
                 {zeroRetention 
-                  ? "When enabled, your connection strings, .pem keys, and processed data reside completely in RAM and are wiped as soon as the session closes. Nothing is saved." 
+                  ? "When enabled, your connection strings, .pem keys, and processed data reside completely in RAM and are wiped as soon as the session closes. Nothing is saved to disk." 
                   : "When disabled, your connection settings may be cached locally for convenience in future sessions."}
               </div>
             </div>
@@ -193,32 +411,101 @@ export default function App() {
             <div className="text-center space-y-4 py-8">
               <h2 className="text-3xl font-bold tracking-tight">Compare Environments</h2>
               <p className="text-slate-400 max-w-2xl mx-auto">
-                Connect your source and target databases to identify DDL differences and data drifts. 
+                Connect your source and target databases to identify DDL differences and data drifts in real-time. 
                 {zeroRetention && " In Zero-Retention Mode, no credentials or data will be saved to disk."}
               </p>
             </div>
 
-            <div className="grid md:grid-cols-2 gap-8 items-start">
-              <ConnectionCard title="Source Database" data={source} onChange={setSource} />
-              <ConnectionCard title="Target Database" data={target} onChange={setTarget} />
+            {/* Quick Actions Toolbar */}
+            <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-800/40 border border-slate-700/50 p-4 rounded-2xl">
+              <div className="flex items-center gap-2 text-xs text-slate-400 font-medium">
+                <Database size={15} className="text-orange-400" />
+                <span>Configure Source and Target Connections below</span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTarget({
+                      ...target,
+                      provider: source.provider,
+                      host: source.host,
+                      port: source.port,
+                      user: source.user,
+                      pass: source.pass,
+                      testStatus: 'idle'
+                    });
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all flex items-center gap-1.5 cursor-pointer"
+                  title="Copy host and credentials from Source to Target"
+                >
+                  <Copy size={13} />
+                  Copy Source to Target
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const temp = { ...source };
+                    setSource({ ...target });
+                    setTarget(temp);
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-all flex items-center gap-1.5 cursor-pointer"
+                  title="Swap Source and Target databases"
+                >
+                  <ArrowRightLeft size={13} />
+                  Swap Databases
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSource(getEmptyState('local'));
+                    setTarget(getEmptyState('local'));
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-red-500/10 text-slate-400 hover:text-red-400 border border-slate-700 hover:border-red-500/30 transition-all flex items-center gap-1.5 cursor-pointer"
+                  title="Reset both connections"
+                >
+                  <Trash2 size={13} />
+                  Clear All
+                </button>
+              </div>
             </div>
 
-            <div className="flex flex-col items-center pt-8 gap-3">
-              <button 
-                onClick={handlePreflight}
-                disabled={!canCompare || isPreflightLoading}
-                className={`group relative px-8 py-4 rounded-xl font-medium shadow-lg flex items-center gap-3 overflow-hidden transition-all ${
-                  (canCompare && !isPreflightLoading)
-                    ? 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20 cursor-pointer' 
-                    : 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                }`}
-              >
-                {(canCompare && !isPreflightLoading) && <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />}
-                <span className="relative z-10 flex items-center gap-2">
-                  {isPreflightLoading ? <Loader2 size={18} className="animate-spin" /> : <Play fill="currentColor" size={18} />}
-                  {isPreflightLoading ? 'Initializing Engine...' : 'Next: Configure Scope'}
-                </span>
-              </button>
+            <div className="grid md:grid-cols-2 gap-8 items-start">
+              <ConnectionCard title="Source Database (Reference)" data={source} onChange={setSource} />
+              <ConnectionCard title="Target Database (To Update)" data={target} onChange={setTarget} />
+            </div>
+
+            <div className="flex flex-col items-center pt-8 gap-4">
+              <div className="flex flex-wrap items-center justify-center gap-4">
+                <button 
+                  type="button"
+                  onClick={handleTestBoth}
+                  disabled={isTestingBoth}
+                  className="px-6 py-4 rounded-xl font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 shadow-md transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                >
+                  {isTestingBoth ? <Loader2 size={18} className="animate-spin text-orange-400" /> : <RefreshCw size={18} />}
+                  {isTestingBoth ? 'Testing Both Connections...' : 'Test Both Connections'}
+                </button>
+
+                <button 
+                  onClick={handlePreflight}
+                  disabled={!canCompare || isPreflightLoading}
+                  className={`group relative px-8 py-4 rounded-xl font-medium shadow-lg flex items-center gap-3 overflow-hidden transition-all ${
+                    (canCompare && !isPreflightLoading)
+                      ? 'bg-orange-600 hover:bg-orange-500 shadow-orange-500/20 cursor-pointer' 
+                      : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  }`}
+                >
+                  {(canCompare && !isPreflightLoading) && <div className="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300 ease-out" />}
+                  <span className="relative z-10 flex items-center gap-2">
+                    {isPreflightLoading ? <Loader2 size={18} className="animate-spin" /> : <Play fill="currentColor" size={18} />}
+                    {isPreflightLoading ? 'Initializing Engine...' : 'Next: Configure Scope'}
+                  </span>
+                </button>
+              </div>
               {!canCompare && (
                 <p className="text-sm text-slate-500">
                   Please test both connections successfully before starting the comparison.
@@ -229,74 +516,149 @@ export default function App() {
         )}
         
         {view === 'preflight' && preflightData && (
-          <div className="max-w-3xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 py-8">
+          <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 py-8">
             <div className="text-center space-y-4">
-              <h2 className="text-3xl font-bold tracking-tight">Comparison Scope</h2>
-              <p className="text-slate-400">
-                We discovered a total of <span className="text-white font-medium">{preflightData.total_objects}</span> objects across both databases. 
-                Select what you want to compare to optimize performance.
+              <h2 className="text-3xl font-bold tracking-tight">Comparison Scope & Engine Configuration</h2>
+              <p className="text-slate-400 max-w-2xl mx-auto">
+                Discovered <span className="text-white font-medium">{preflightData.total_objects}</span> structural objects and <span className="text-white font-medium">{preflightData.common_tables?.length || 0}</span> common tables. 
+                Select the structural and data layers to compare.
               </p>
             </div>
             
-            <div className="bg-slate-800/40 border border-slate-700/50 rounded-2xl p-8 relative overflow-hidden">
-              <div className="absolute top-0 right-0 p-8 opacity-5">
-                <Filter size={120} />
-              </div>
+            <div className="grid md:grid-cols-3 gap-6">
               
-              <div className="relative z-10 grid sm:grid-cols-2 gap-8">
-                
-                <div className="space-y-4">
-                  <h3 className="font-medium flex items-center gap-2 border-b border-slate-700/50 pb-2">
+              {/* DDL Scope */}
+              <div className="md:col-span-2 bg-slate-800/40 border border-slate-700/50 rounded-2xl p-6 space-y-4">
+                <h3 className="font-medium flex items-center justify-between border-b border-slate-700/50 pb-3">
+                  <span className="flex items-center gap-2 text-slate-200">
                     <Database size={16} className="text-orange-400" />
-                    Object Types
-                  </h3>
-                  
-                  {['tables', 'views', 'functions', 'sequences', 'triggers'].map(type => (
-                    <label key={type} className="flex items-center justify-between p-3 rounded-lg border border-slate-700/50 hover:bg-slate-700/30 cursor-pointer transition-colors bg-slate-900/50">
-                      <div className="flex items-center gap-3">
-                        <input 
-                          type="checkbox" 
-                          checked={selectedObjects[type]} 
-                          onChange={e => setSelectedObjects({...selectedObjects, [type]: e.target.checked})}
-                          className="w-4 h-4 text-orange-500 bg-slate-900 border-slate-700 rounded focus:ring-orange-500 focus:ring-2"
-                        />
-                        <span className="capitalize text-sm font-medium">{type}</span>
+                    DDL Schema Objects
+                  </span>
+                  <span className="text-xs text-slate-500 font-mono">Source (S) / Target (T)</span>
+                </h3>
+                
+                <div className="grid sm:grid-cols-2 gap-3">
+                  {SCHEMA_OBJECTS.map(obj => (
+                    <label key={obj.key} className="flex flex-col justify-between p-3 rounded-lg border border-slate-700/50 hover:bg-slate-700/30 cursor-pointer transition-colors bg-slate-900/50">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2.5">
+                          <input 
+                            type="checkbox" 
+                            checked={!!selectedObjects[obj.key]} 
+                            onChange={e => setSelectedObjects({...selectedObjects, [obj.key]: e.target.checked})}
+                            className="w-4 h-4 text-orange-500 bg-slate-900 border-slate-700 rounded focus:ring-orange-500 focus:ring-2"
+                          />
+                          <span className="text-sm font-medium text-slate-200">{obj.label}</span>
+                        </div>
+                        <span className="text-xs font-mono text-slate-400">
+                          {preflightData.source_counts[obj.key] || 0} (S) / {preflightData.target_counts[obj.key] || 0} (T)
+                        </span>
                       </div>
-                      <span className="text-xs text-slate-400">
-                        {preflightData.source_counts[type]} (S) / {preflightData.target_counts[type]} (T)
-                      </span>
+                      <span className="text-[11px] text-slate-500 mt-1 pl-6.5">{obj.desc}</span>
                     </label>
                   ))}
                 </div>
-                
-                <div className="flex flex-col justify-center items-center text-center p-6 bg-slate-900/50 border border-slate-700/50 rounded-xl space-y-4">
-                   <div className="p-4 bg-orange-500/10 rounded-full text-orange-400">
+
+                {/* Data Drift Scope */}
+                <div className="pt-4 border-t border-slate-700/50 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="flex items-center gap-2.5 cursor-pointer">
+                      <input 
+                        type="checkbox" 
+                        checked={compareDataEnabled} 
+                        onChange={e => setCompareDataEnabled(e.target.checked)}
+                        className="w-4 h-4 text-orange-500 bg-slate-900 border-slate-700 rounded focus:ring-orange-500 focus:ring-2"
+                      />
+                      <span className="font-medium text-sm text-slate-200 flex items-center gap-1.5">
+                        <Table size={16} className="text-blue-400" />
+                        Enable Data Drift Detection
+                      </span>
+                    </label>
+                    <span className="text-xs px-2 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-500/30">
+                      In-Memory MD5 Hashing
+                    </span>
+                  </div>
+
+                  {compareDataEnabled && (
+                    <div className="pl-6 space-y-2 text-xs">
+                      <p className="text-slate-400">
+                        Select common tables to analyze for row count drift, checksum mismatch, and exact record differences:
+                      </p>
+                      {preflightData.common_tables && preflightData.common_tables.length > 0 ? (
+                        <div className="flex flex-wrap gap-2 pt-1">
+                          {preflightData.common_tables.map(tbl => {
+                            const isSelected = selectedDataTables.includes(tbl);
+                            return (
+                              <button
+                                key={tbl}
+                                type="button"
+                                onClick={() => {
+                                  if (isSelected) {
+                                    setSelectedDataTables(selectedDataTables.filter(t => t !== tbl));
+                                  } else {
+                                    setSelectedDataTables([...selectedDataTables, tbl]);
+                                  }
+                                }}
+                                className={`px-2.5 py-1 rounded-md border text-xs font-mono transition-colors ${
+                                  isSelected 
+                                    ? 'bg-orange-500/20 text-orange-400 border-orange-500/40' 
+                                    : 'bg-slate-900/60 text-slate-500 border-slate-700 hover:text-slate-300'
+                                }`}
+                              >
+                                {tbl}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ) : (
+                        <p className="text-slate-500 italic">No common tables detected between source and target.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+              
+              {/* ETA & Summary */}
+              <div className="flex flex-col justify-between p-6 bg-slate-800/40 border border-slate-700/50 rounded-2xl text-center">
+                 <div className="space-y-4 pt-4">
+                   <div className="p-4 bg-orange-500/10 rounded-full text-orange-400 w-16 h-16 mx-auto flex items-center justify-center">
                      <Clock size={32} />
                    </div>
                    <div>
-                     <p className="text-slate-400 text-sm">Estimated Completion Time</p>
+                     <p className="text-slate-400 text-sm">Estimated Run Time</p>
                      <p className="text-4xl font-bold tracking-tight mt-1 text-slate-100">
                        ~{dynamicEta} <span className="text-xl text-slate-500 font-normal">sec</span>
                      </p>
                    </div>
-                   <p className="text-xs text-slate-500 max-w-[200px] mt-4">
-                     Time is based on the volume of structural metadata that needs to be extracted and diffed in memory.
+                   <p className="text-xs text-slate-500">
+                     Extraction, cryptographic hashing, and differing executed entirely in memory under Zero-Retention policy.
                    </p>
-                </div>
-                
+                 </div>
+
+                 <div className="pt-6 border-t border-slate-700/50 space-y-2">
+                   <div className="flex justify-between text-xs text-slate-400">
+                     <span>DDL Objects:</span>
+                     <span className="text-slate-200 font-mono">{preflightData.total_objects}</span>
+                   </div>
+                   <div className="flex justify-between text-xs text-slate-400">
+                     <span>Data Tables:</span>
+                     <span className="text-slate-200 font-mono">{compareDataEnabled ? selectedDataTables.length : 0}</span>
+                   </div>
+                 </div>
               </div>
+              
             </div>
             
             <div className="flex justify-center gap-4 pt-4">
               <button 
                 onClick={() => setView('setup')}
-                className="px-6 py-3 rounded-xl font-medium border border-slate-700 hover:bg-slate-800 transition-colors"
+                className="px-6 py-3 rounded-xl font-medium border border-slate-700 hover:bg-slate-800 transition-colors cursor-pointer"
               >
                 Back
               </button>
               <button 
                 onClick={handleStartComparison}
-                className="px-8 py-3 rounded-xl font-medium bg-orange-600 hover:bg-orange-500 transition-colors shadow-lg shadow-orange-500/20 flex items-center gap-2"
+                className="px-8 py-3 rounded-xl font-medium bg-orange-600 hover:bg-orange-500 transition-colors shadow-lg shadow-orange-500/20 flex items-center gap-2 cursor-pointer"
               >
                 <Play fill="currentColor" size={16} />
                 Confirm & Run Comparison
@@ -313,35 +675,122 @@ export default function App() {
             </div>
             <div className="text-center space-y-2">
               <h3 className="text-xl font-medium">Analyzing Environments</h3>
-              <p className="text-slate-400">Extracting and differing metadata securely in memory...</p>
+              <p className="text-slate-400">Extracting DDL schemas & hashing row data in-memory...</p>
+              <div className="flex items-center justify-center gap-2 text-xs text-slate-500 mt-2">
+                <Shield size={12} className="text-green-400" />
+                Zero-Retention: No schemas or credentials written to disk
+              </div>
             </div>
           </div>
         )}
 
         {view === 'results' && (
           <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <div className="flex items-center justify-between">
-              <h2 className="text-2xl font-semibold">Comparison Results</h2>
-              <button onClick={() => setView('setup')} className="text-sm text-slate-400 hover:text-orange-400 transition-colors">
-                &larr; Back to Setup
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-2xl font-bold tracking-tight text-white">Comparison Results</h2>
+                <div className="flex flex-wrap items-center gap-2 mt-2">
+                  <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/90 border border-slate-700/80 font-mono text-xs shadow-sm">
+                    <span className="text-slate-400 font-sans font-medium">Source:</span>
+                    <span className="text-orange-400 font-semibold">{source.host || '127.0.0.1'}:{source.port || '5432'}/{source.provider === 'oracle' ? source.oracleService : (source.dbName || 'source_db')}</span>
+                    <span className="text-slate-500 font-sans mx-1">→</span>
+                    <span className="text-slate-400 font-sans font-medium">Target:</span>
+                    <span className="text-blue-400 font-semibold">{target.host || '127.0.0.1'}:{target.port || '5432'}/{target.provider === 'oracle' ? target.oracleService : (target.dbName || 'target_db')}</span>
+                  </div>
+                </div>
+              </div>
+              <div className="flex items-center gap-3">
+                <button 
+                  onClick={openSyncModal}
+                  className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer"
+                >
+                  <FileText size={16} />
+                  Generate Sync Script
+                </button>
+                <button 
+                  onClick={() => setView('setup')} 
+                  className="px-3.5 py-2 rounded-xl border border-slate-700 hover:bg-slate-800 text-sm text-slate-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  &larr; Back
+                </button>
+              </div>
+            </div>
+
+            {/* Navigation Tabs (DDL vs Data) */}
+            <div className="flex border-b border-slate-800 gap-2">
+              <button
+                onClick={() => setActiveResultTab('ddl')}
+                className={`flex items-center gap-2 px-5 py-3 border-b-2 font-medium text-sm transition-colors cursor-pointer ${
+                  activeResultTab === 'ddl'
+                    ? 'border-orange-500 text-orange-400 bg-orange-500/5'
+                    : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Settings2 size={16} />
+                Structured DDL Differences
+                <span className={`px-2 py-0.5 rounded-full text-xs font-mono ${diffs.length > 0 ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'}`}>
+                  {diffs.length}
+                </span>
+              </button>
+
+              <button
+                onClick={() => setActiveResultTab('data')}
+                className={`flex items-center gap-2 px-5 py-3 border-b-2 font-medium text-sm transition-colors cursor-pointer ${
+                  activeResultTab === 'data'
+                    ? 'border-blue-500 text-blue-400 bg-blue-500/5'
+                    : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <Table size={16} />
+                Data Inconsistencies & Drift
+                {dataDiff && (
+                  <span className={`px-2 py-0.5 rounded-full text-xs font-mono ${
+                    dataDiff.summary.tables_with_drift > 0 ? 'bg-amber-500/10 text-amber-400' : 'bg-green-500/10 text-green-400'
+                  }`}>
+                    {dataDiff.summary.tables_with_drift} Drifted
+                  </span>
+                )}
               </button>
             </div>
             
-            <div className="grid md:grid-cols-2 gap-6">
-              <div className="bg-slate-800/50 rounded-2xl border border-slate-700/50 p-6 space-y-4 md:col-span-2">
-                <div className="flex items-center justify-between border-b border-slate-700/50 pb-4">
-                  <h3 className="font-medium flex items-center gap-2">
-                    <Settings2 size={18} className="text-purple-400" />
-                    Structured DDL Differences
-                  </h3>
-                  <div className="flex items-center gap-3">
-                    <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${diffs.length > 0 ? 'bg-red-500/10 text-red-400' : 'bg-green-500/10 text-green-400'}`}>
-                      {diffs.length} Changes Detected
-                    </span>
-                    <button className="px-3 py-1.5 bg-orange-500/10 hover:bg-orange-500/20 text-orange-400 text-xs font-medium rounded-lg border border-orange-500/30 transition-colors flex items-center gap-1.5">
-                      Generate Sync Script
-                    </button>
+            {/* TAB 1: DDL DIFFERENCES */}
+            {activeResultTab === 'ddl' && (
+              <div className="bg-slate-800/40 rounded-2xl border border-slate-700/50 p-6 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-700/50 pb-4">
+                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                    <Filter size={14} className="text-slate-400 mr-1" />
+                    <span className="text-slate-400 uppercase tracking-wider font-medium mr-1">Filter:</span>
+                    {[
+                      { key: 'all', label: 'All' },
+                      { key: 'table', label: 'Tables' },
+                      { key: 'column', label: 'Columns' },
+                      { key: 'index', label: 'Indexes' },
+                      { key: 'view', label: 'Views' },
+                      { key: 'materialized_view', label: 'Mat Views' },
+                      { key: 'function', label: 'Functions' },
+                      { key: 'procedure', label: 'Procedures' },
+                      { key: 'sequence', label: 'Sequences' },
+                      { key: 'trigger', label: 'Triggers' },
+                      { key: 'role', label: 'Users & Roles' },
+                      { key: 'grant', label: 'Grants' }
+                    ].map(cat => (
+                      <button
+                        key={cat.key}
+                        onClick={() => setDdlFilter(cat.key)}
+                        className={`px-2.5 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                          ddlFilter === cat.key 
+                            ? 'bg-orange-500/20 text-orange-400 border border-orange-500/40' 
+                            : 'bg-slate-900/60 text-slate-400 border border-slate-700 hover:text-white'
+                        }`}
+                      >
+                        {cat.label}
+                      </button>
+                    ))}
                   </div>
+                  
+                  <span className="text-xs text-slate-400">
+                    Showing <strong className="text-white">{filteredDiffs.length}</strong> of {diffs.length} differences
+                  </span>
                 </div>
                 
                 <div className="overflow-x-auto">
@@ -350,23 +799,50 @@ export default function App() {
                       <tr>
                         <th className="px-4 py-3 rounded-tl-lg">Object</th>
                         <th className="px-4 py-3">Source (Actual)</th>
-                        <th className="px-4 py-3 rounded-tr-lg">Target (Actual)</th>
+                        <th className="px-4 py-3">Target (Actual)</th>
+                        <th className="px-4 py-3 rounded-tr-lg">Drift Classification</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-700/50">
-                      {diffs.length === 0 ? (
+                      {filteredDiffs.length === 0 ? (
                         <tr>
-                          <td colSpan={3} className="px-4 py-8 text-center text-slate-500 font-medium">No differences found! Schemas are perfectly aligned.</td>
+                          <td colSpan={4} className="px-4 py-8 text-center text-slate-500 font-medium">
+                            {diffs.length === 0 
+                              ? 'No DDL differences found! Schemas are perfectly aligned.' 
+                              : 'No differences match the selected filter.'}
+                          </td>
                         </tr>
                       ) : (
-                        diffs.map((diff, i) => (
+                        filteredDiffs.map((diff, i) => (
                           <tr key={i} className="hover:bg-slate-800/30 transition-colors">
-                            <td className="px-4 py-3 font-medium text-slate-300">{diff.object}</td>
-                            <td className={`px-4 py-3 font-mono text-xs ${diff.status === 'missing_source' ? 'text-red-400' : diff.status === 'mismatch' ? 'text-amber-400' : 'text-green-400'}`}>
+                            <td className="px-4 py-3 font-medium text-slate-200">
+                              <span className="font-mono text-xs text-orange-400 mr-2 bg-orange-500/10 px-1.5 py-0.5 rounded border border-orange-500/20 capitalize">
+                                {diff.object_type.replace('_', ' ')}
+                              </span>
+                              {diff.name || diff.object}
+                            </td>
+                            <td className="px-4 py-3 font-mono text-xs text-green-400">
                               {diff.source_actual}
                             </td>
                             <td className={`px-4 py-3 font-mono text-xs ${diff.status === 'missing_target' ? 'text-red-400' : diff.status === 'mismatch' ? 'text-amber-400' : 'text-slate-300'}`}>
                               {diff.target_actual}
+                            </td>
+                            <td className="px-4 py-3 text-xs">
+                              {diff.status === 'missing_target' && (
+                                <span className="px-2 py-1 rounded-md bg-red-500/10 text-red-400 border border-red-500/30 font-medium">
+                                  Missing in Target
+                                </span>
+                              )}
+                              {diff.status === 'missing_source' && (
+                                <span className="px-2 py-1 rounded-md bg-purple-500/10 text-purple-400 border border-purple-500/30 font-medium">
+                                  Extra in Target (Missing in Source)
+                                </span>
+                              )}
+                              {diff.status === 'mismatch' && (
+                                <span className="px-2 py-1 rounded-md bg-amber-500/10 text-amber-400 border border-amber-500/30 font-medium">
+                                  Definition Mismatch
+                                </span>
+                              )}
                             </td>
                           </tr>
                         ))
@@ -375,6 +851,311 @@ export default function App() {
                   </table>
                 </div>
               </div>
+            )}
+
+            {/* TAB 2: DATA DRIFT */}
+            {activeResultTab === 'data' && (
+              <div className="space-y-6">
+                {!dataDiff ? (
+                  <div className="bg-slate-800/40 rounded-2xl border border-slate-700/50 p-8 text-center space-y-3">
+                    <Table size={40} className="text-slate-600 mx-auto" />
+                    <p className="text-slate-400 font-medium">Data comparison was not enabled for this run.</p>
+                    <button 
+                      onClick={() => setView('preflight')}
+                      className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-orange-400 rounded-lg text-sm border border-slate-700 cursor-pointer"
+                    >
+                      Configure Scope & Enable Data Comparison
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    {/* Summary KPI Cards */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4">
+                        <span className="text-xs text-slate-400 uppercase tracking-wider">Tables Analyzed</span>
+                        <p className="text-2xl font-bold mt-1 text-slate-100">{dataDiff.summary.tables_analyzed}</p>
+                      </div>
+                      <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4">
+                        <span className="text-xs text-slate-400 uppercase tracking-wider">Tables in Sync</span>
+                        <p className="text-2xl font-bold mt-1 text-green-400">{dataDiff.summary.tables_in_sync}</p>
+                      </div>
+                      <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4">
+                        <span className="text-xs text-slate-400 uppercase tracking-wider">Tables with Drift</span>
+                        <p className={`text-2xl font-bold mt-1 ${dataDiff.summary.tables_with_drift > 0 ? 'text-amber-400' : 'text-slate-400'}`}>
+                          {dataDiff.summary.tables_with_drift}
+                        </p>
+                      </div>
+                      <div className="bg-slate-800/40 border border-slate-700/50 rounded-xl p-4">
+                        <span className="text-xs text-slate-400 uppercase tracking-wider">Row Discrepancies</span>
+                        <p className="text-2xl font-bold mt-1 text-orange-400">
+                          {dataDiff.summary.total_missing_target + dataDiff.summary.total_missing_source + dataDiff.summary.total_value_mismatches}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Table-by-table cards */}
+                    <div className="space-y-4">
+                      {Object.keys(dataDiff.tables).map(tName => {
+                        const tInfo = dataDiff.tables[tName];
+                        const isExpanded = !!expandedTables[tName];
+                        const isInSync = tInfo.status === 'in_sync';
+
+                        return (
+                          <div key={tName} className="bg-slate-800/40 border border-slate-700/50 rounded-2xl overflow-hidden">
+                            <div 
+                              onClick={() => toggleTableExpand(tName)}
+                              className="p-5 flex flex-wrap items-center justify-between gap-4 cursor-pointer hover:bg-slate-800/60 transition-colors"
+                            >
+                              <div className="flex items-center gap-3">
+                                {isExpanded ? <ChevronDown size={18} className="text-slate-400" /> : <ChevronRight size={18} className="text-slate-400" />}
+                                <div>
+                                  <h4 className="font-semibold text-slate-200 flex items-center gap-2">
+                                    <Table size={16} className="text-blue-400" />
+                                    {tName}
+                                  </h4>
+                                  <p className="text-xs text-slate-400 mt-0.5">
+                                    PK: <span className="font-mono text-slate-300">{tInfo.primary_keys?.join(', ') || 'None'}</span> | Common Columns: <span className="text-slate-300">{tInfo.common_columns?.length || 0}</span>
+                                  </p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-4 text-xs">
+                                <div className="text-right">
+                                  <span className="text-slate-400">Rows:</span>{' '}
+                                  <strong className="text-slate-200 font-mono">{tInfo.source_row_count}</strong> (S) / <strong className="text-slate-200 font-mono">{tInfo.target_row_count}</strong> (T)
+                                </div>
+
+                                <div className="hidden sm:block text-right">
+                                  <span className="text-slate-400">MD5 Checksum:</span>{' '}
+                                  <span className="font-mono text-[11px] text-slate-400">{tInfo.source_checksum?.slice(0, 8)}...</span>
+                                </div>
+
+                                <span className={`px-2.5 py-1 rounded-full text-xs font-medium border ${
+                                  isInSync 
+                                    ? 'bg-green-500/10 text-green-400 border-green-500/30' 
+                                    : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                                }`}>
+                                  {isInSync ? '100% In Sync' : 'Drift Detected'}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* Expanded details */}
+                            {isExpanded && (
+                              <div className="border-t border-slate-700/50 p-5 space-y-4 bg-slate-900/40 text-xs">
+                                {isInSync ? (
+                                  <div className="text-center py-4 text-green-400 flex items-center justify-center gap-2">
+                                    <CheckCircle2 size={16} />
+                                    Checksums and all rows in &ldquo;{tName}&rdquo; are identical across both databases.
+                                  </div>
+                                ) : (
+                                  <div className="space-y-4">
+                                    <div className="grid grid-cols-3 gap-3">
+                                      <div className="p-3 rounded-lg bg-slate-800/60 border border-slate-700">
+                                        <span className="text-slate-400">Missing in Target:</span>
+                                        <p className="text-base font-bold text-red-400 mt-1">{tInfo.missing_in_target_count}</p>
+                                      </div>
+                                      <div className="p-3 rounded-lg bg-slate-800/60 border border-slate-700">
+                                        <span className="text-slate-400">Extra in Target (Missing Source):</span>
+                                        <p className="text-base font-bold text-purple-400 mt-1">{tInfo.missing_in_source_count}</p>
+                                      </div>
+                                      <div className="p-3 rounded-lg bg-slate-800/60 border border-slate-700">
+                                        <span className="text-slate-400">Value Mismatches:</span>
+                                        <p className="text-base font-bold text-amber-400 mt-1">{tInfo.mismatched_rows_count}</p>
+                                      </div>
+                                    </div>
+
+                                    {/* Mismatched records table */}
+                                    {tInfo.sample_mismatches && tInfo.sample_mismatches.length > 0 && (
+                                      <div className="space-y-2">
+                                        <h5 className="font-medium text-slate-300">Sample Row Mismatches:</h5>
+                                        <div className="overflow-x-auto rounded-lg border border-slate-700">
+                                          <table className="w-full text-left">
+                                            <thead className="bg-slate-800 text-slate-400">
+                                              <tr>
+                                                <th className="px-3 py-2">Primary Key</th>
+                                                <th className="px-3 py-2">Differing Column</th>
+                                                <th className="px-3 py-2">Source Value</th>
+                                                <th className="px-3 py-2">Target Value</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-800">
+                                              {tInfo.sample_mismatches.map((m: any, idx: number) => (
+                                                <tr key={idx} className="hover:bg-slate-800/30">
+                                                  <td className="px-3 py-2 font-mono text-slate-200">{JSON.stringify(m.pk)}</td>
+                                                  <td className="px-3 py-2 font-mono text-amber-400">{m.diff_columns?.join(', ')}</td>
+                                                  <td className="px-3 py-2 font-mono text-green-400">{JSON.stringify(m.source_values)}</td>
+                                                  <td className="px-3 py-2 font-mono text-red-400">{JSON.stringify(m.target_values)}</td>
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+                                        </div>
+                                      </div>
+                                    )}
+
+                                    {/* Missing in Target sample */}
+                                    {tInfo.sample_missing_in_target && tInfo.sample_missing_in_target.length > 0 && (
+                                      <div className="space-y-2">
+                                        <h5 className="font-medium text-slate-300">Sample Rows Missing in Target:</h5>
+                                        <div className="overflow-x-auto rounded-lg border border-slate-700 p-2 bg-slate-900/60 font-mono text-[11px] text-slate-300 max-h-32">
+                                          {tInfo.sample_missing_in_target.map((item: any, idx: number) => (
+                                            <div key={idx} className="py-0.5 text-red-300">
+                                              PK: {JSON.stringify(item.pk)} &rarr; Data: {JSON.stringify(item.row)}
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Sync Script Modal */}
+        {isSyncModalOpen && (
+          <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+            <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
+              
+              {/* Modal Header */}
+              <div className="p-6 border-b border-slate-800 flex items-center justify-between">
+                <div>
+                  <h3 className="text-xl font-bold text-slate-100 flex items-center gap-2">
+                    <FileText size={20} className="text-orange-400" />
+                    Generated Synchronization Script
+                  </h3>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Auto-generated DDL and data migration statements to bring Target up to parity with Source.
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setIsSyncModalOpen(false)}
+                  className="p-1 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+                >
+                  <XCircle size={20} />
+                </button>
+              </div>
+
+              {/* Modal Options Bar */}
+              <div className="px-6 py-3 bg-slate-800/40 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs">
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      checked={syncSafeMode} 
+                      onChange={e => {
+                        const val = e.target.checked;
+                        setSyncSafeMode(val);
+                        handleFetchSyncScript(val, syncIncludeDdl, syncIncludeData);
+                      }}
+                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
+                    />
+                    <span className="font-medium text-slate-200 flex items-center gap-1">
+                      <Shield size={14} className={syncSafeMode ? 'text-green-400' : 'text-slate-500'} />
+                      Safe Mode (Comment Destructive Drops)
+                    </span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      checked={syncIncludeDdl} 
+                      onChange={e => {
+                        const val = e.target.checked;
+                        setSyncIncludeDdl(val);
+                        handleFetchSyncScript(syncSafeMode, val, syncIncludeData);
+                      }}
+                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
+                    />
+                    <span className="text-slate-300">DDL Statements</span>
+                  </label>
+
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input 
+                      type="checkbox" 
+                      checked={syncIncludeData} 
+                      onChange={e => {
+                        const val = e.target.checked;
+                        setSyncIncludeData(val);
+                        handleFetchSyncScript(syncSafeMode, syncIncludeDdl, val);
+                      }}
+                      className="w-4 h-4 text-orange-500 rounded bg-slate-900 border-slate-700"
+                    />
+                    <span className="text-slate-300">Data Sync</span>
+                  </label>
+                </div>
+
+                {syncStats && (
+                  <div className="flex items-center gap-3 text-slate-400 font-mono">
+                    <span>Statements: <strong className="text-orange-400">{syncStats.statements_count}</strong></span>
+                  </div>
+                )}
+              </div>
+
+              {/* Code viewer */}
+              <div className="flex-1 p-6 overflow-y-auto">
+                {syncLoading ? (
+                  <div className="h-64 flex flex-col items-center justify-center space-y-3">
+                    <Loader2 size={28} className="animate-spin text-orange-500" />
+                    <p className="text-sm text-slate-400">Synthesizing PostgreSQL migration script...</p>
+                  </div>
+                ) : (
+                  <div className="relative">
+                    <div className="flex items-center justify-between px-4 py-2.5 bg-slate-950 border border-b-0 border-slate-800 rounded-t-xl text-xs text-slate-400">
+                      <span className="font-mono text-slate-300">PostgreSQL Migration Script ({syncScript.split('\n').length} lines)</span>
+                      <button
+                        onClick={handleCopyScript}
+                        className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-all cursor-pointer"
+                      >
+                        {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
+                        {copied ? 'Copied to Clipboard!' : 'Copy Script'}
+                      </button>
+                    </div>
+                    <pre className="p-4 bg-slate-950 rounded-b-xl border border-slate-800 text-xs font-mono text-slate-200 overflow-x-auto leading-relaxed select-all max-h-[50vh]">
+                      {syncScript}
+                    </pre>
+                  </div>
+                )}
+              </div>
+
+              {/* Modal Footer */}
+              <div className="p-6 border-t border-slate-800 flex items-center justify-between bg-slate-900/50">
+                <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                  <Shield size={14} className="text-green-400" />
+                  Script runs inside a single atomic transaction (<code className="text-slate-400">BEGIN; ... COMMIT;</code>)
+                </p>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleCopyScript}
+                    disabled={syncLoading || !syncScript}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium rounded-xl border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {copied ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
+                    {copied ? 'Copied to Clipboard' : 'Copy SQL'}
+                  </button>
+
+                  <button
+                    onClick={handleDownloadScript}
+                    disabled={syncLoading || !syncScript}
+                    className="px-5 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    <Download size={16} />
+                    Download .sql
+                  </button>
+                </div>
+              </div>
+
             </div>
           </div>
         )}
@@ -382,14 +1163,14 @@ export default function App() {
         {/* Legal Pages */}
         {['about', 'privacy', 'terms', 'contact'].includes(view) && (
           <div className="max-w-3xl mx-auto space-y-6 bg-slate-800/40 p-8 rounded-2xl border border-slate-700/50 animate-in fade-in slide-in-from-bottom-4">
-            <button onClick={() => setView('setup')} className="text-sm text-orange-400 hover:text-orange-300 transition-colors mb-4 block">
+            <button onClick={() => setView('setup')} className="text-sm text-orange-400 hover:text-orange-300 transition-colors mb-4 block cursor-pointer">
               &larr; Back to Tool
             </button>
             
             {view === 'about' && (
               <div className="prose prose-invert prose-orange max-w-none">
                 <h2>About NamangyaDB</h2>
-                <p>NamangyaDB is an advanced database management and comparison utility engineered for modern cloud architectures. Built by database professionals for database professionals, our mission is to eliminate the friction and uncertainty associated with schema migrations across disparate environments.</p>
+                <p>NamangyaDB is an enterprise-grade database management and comparison utility engineered for modern cloud architectures. Built by database professionals for database professionals, our mission is to eliminate the friction and uncertainty associated with schema migrations across disparate environments.</p>
                 <p>We support all major cloud providers, including AWS, Azure, Oracle Cloud, and Supabase, as well as local instances. Our platform is designed with a core philosophy of extreme security and zero data residency.</p>
               </div>
             )}
@@ -407,8 +1188,6 @@ export default function App() {
                   <li>Any schema (DDL) or row-level data extracted during comparison.</li>
                 </ul>
                 <p>All operations are performed entirely in-memory (RAM) and are completely wiped the moment your session is terminated or the browser is closed. SSH keys are written to ephemeral, OS-level secure temp files strictly for the duration of the tunnel handshake and are immediately unlinked from the filesystem.</p>
-                <h3>2. Telemetry</h3>
-                <p>We collect basic, anonymized page-visit telemetry (represented by the visit counter) solely for the purpose of understanding platform load. No personally identifiable information (PII) is associated with this data.</p>
               </div>
             )}
 
@@ -426,7 +1205,7 @@ export default function App() {
             {view === 'contact' && (
               <div className="prose prose-invert prose-orange max-w-none">
                 <h2>Contact Us</h2>
-                <p>Have questions about NamangyaDB, require enterprise support, or want to report an issue? We'd love to hear from you.</p>
+                <p>Have questions about NamangyaDB, require enterprise support, or want to report an issue? We&apos;d love to hear from you.</p>
                 <div className="bg-slate-900/50 p-6 rounded-lg border border-slate-700 mt-6">
                   <p className="m-0 text-slate-300"><strong>Email:</strong> support@namangyadb.com</p>
                   <p className="m-0 text-slate-300 mt-2"><strong>Enterprise Sales:</strong> enterprise@namangyadb.com</p>
@@ -443,16 +1222,16 @@ export default function App() {
       <footer className="border-t border-slate-800 bg-slate-900/50 shrink-0">
         <div className="max-w-7xl mx-auto px-4 py-6 flex flex-col md:flex-row items-center justify-between text-xs text-slate-500 gap-4">
           <div className="flex items-center gap-2">
-            <span className="font-mono bg-slate-800 px-2 py-1 rounded text-slate-400 border border-slate-700 flex items-center gap-1">
+            <span className="font-mono bg-slate-800 px-2.5 py-1 rounded-md text-slate-300 border border-slate-700 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
-              Visits: 001248
+              Session: Active (RAM Only)
             </span>
           </div>
           <div className="flex items-center gap-6">
-            <button onClick={() => setView('about')} className="hover:text-orange-400 transition-colors">About Us</button>
-            <button onClick={() => setView('privacy')} className="hover:text-orange-400 transition-colors">Privacy Policy</button>
-            <button onClick={() => setView('terms')} className="hover:text-orange-400 transition-colors">Terms</button>
-            <button onClick={() => setView('contact')} className="hover:text-orange-400 transition-colors">Contact Us</button>
+            <button onClick={() => setView('about')} className="hover:text-orange-400 transition-colors cursor-pointer">About Us</button>
+            <button onClick={() => setView('privacy')} className="hover:text-orange-400 transition-colors cursor-pointer">Privacy Policy</button>
+            <button onClick={() => setView('terms')} className="hover:text-orange-400 transition-colors cursor-pointer">Terms</button>
+            <button onClick={() => setView('contact')} className="hover:text-orange-400 transition-colors cursor-pointer">Contact Us</button>
           </div>
           <div className="text-slate-600">
             &copy; {new Date().getFullYear()} NamangyaDB. All rights reserved.
@@ -490,7 +1269,6 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
   };
 
   const validationError = getHostValidationError();
-  // Is it a hard error (blocks connection) or just a warning?
   const isHardError = validationError?.includes('cannot be localhost');
 
   const isFilled = () => {
@@ -500,7 +1278,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
     if (data.method === 'ssh') {
       if (!data.sshHost || !data.sshUser || !data.sshKey) return false;
     }
-    if (isHardError) return false; // Block if hard error
+    if (isHardError) return false;
     return true;
   };
 
@@ -535,9 +1313,13 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         body: JSON.stringify(payload)
       });
       
-      if (!res.ok) throw new Error('Connection failed');
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => ({}));
+        throw new Error(errJson.detail || 'Connection failed');
+      }
       onChange({ ...data, testStatus: type === 'full' ? 'success' : 'idle' });
     } catch (err) {
+      console.error("Test connection error:", err);
       onChange({ ...data, testStatus: 'error' });
     }
   };
@@ -547,7 +1329,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
       <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-orange-500 to-amber-500 opacity-50 group-hover:opacity-100 transition-opacity" />
       
       <div className="flex items-center justify-between mb-6">
-        <h3 className="text-lg font-medium flex items-center gap-2">
+        <h3 className="text-lg font-medium flex items-center gap-2 text-white">
           <Database size={18} className="text-orange-400" />
           {title}
         </h3>
@@ -559,13 +1341,13 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
           <select 
             value={data.provider}
             onChange={(e) => handleProviderChange(e.target.value as ProviderType)}
-            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all"
+            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all cursor-pointer"
           >
+            <option value="local">Local PostgreSQL</option>
             <option value="aws">AWS (RDS / Aurora)</option>
             <option value="azure">Azure Database</option>
             <option value="oracle">Oracle Cloud</option>
             <option value="supabase">Supabase</option>
-            <option value="local">Local</option>
           </select>
         </div>
 
@@ -573,13 +1355,13 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
           <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Connection Method</label>
           <div className="flex bg-slate-900 p-1 rounded-lg border border-slate-700">
             <button 
-              className={`flex-1 text-sm py-1.5 rounded-md transition-colors ${data.method === 'direct' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
+              className={`flex-1 text-sm py-1.5 rounded-md transition-colors cursor-pointer ${data.method === 'direct' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
               onClick={() => onChange({...data, method: 'direct', testStatus: 'idle'})}
             >
               Direct
             </button>
             <button 
-              className={`flex-1 text-sm py-1.5 rounded-md transition-colors ${data.method === 'ssh' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
+              className={`flex-1 text-sm py-1.5 rounded-md transition-colors cursor-pointer ${data.method === 'ssh' ? 'bg-slate-700 text-white font-medium shadow-sm' : 'text-slate-400 hover:text-slate-300'}`}
               onClick={() => onChange({...data, method: 'ssh', testStatus: 'idle'})}
             >
               Via SSH Tunnel
@@ -604,7 +1386,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
                   validationError ? 'border-amber-500/50 focus:ring-amber-500/50' : 
                   'border-slate-700 focus:ring-2 focus:ring-orange-500 focus:border-orange-500'
                 }`}
-                placeholder="db.example.com" 
+                placeholder="127.0.0.1 or db.example.com" 
               />
               {validationError && (
                 <p className={`text-[10px] mt-1.5 flex items-center gap-1 ${isHardError ? 'text-red-400' : 'text-amber-400'}`}>
@@ -677,7 +1459,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
           <button
             onClick={() => handleTestConnection('ssh_only')}
             disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
-            className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors py-2.5 rounded-lg text-sm font-medium border border-slate-700"
+            className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors py-2.5 rounded-lg text-sm font-medium border border-slate-700 cursor-pointer"
           >
             {data.testStatus === 'testing_ssh' ? <><Loader2 size={16} className="animate-spin" /> Testing SSH...</> : 'Test SSH Tunnel'}
           </button>
@@ -686,7 +1468,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         <button
           onClick={() => handleTestConnection('full')}
           disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
-          className={`w-full flex items-center justify-center gap-2 transition-colors py-2.5 rounded-lg text-sm font-medium ${
+          className={`w-full flex items-center justify-center gap-2 transition-colors py-2.5 rounded-lg text-sm font-medium cursor-pointer ${
             data.testStatus === 'success' ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 
             data.testStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/30' :
             'bg-slate-700 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed'
