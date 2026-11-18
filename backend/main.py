@@ -1,10 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import psycopg2
+import paramiko
+# Compatibility shim: paramiko 3.x+ in Python 3.14 removed DSSKey (DSA), which causes sshtunnel to crash in get_keys()
+if not hasattr(paramiko, 'DSSKey'):
+    paramiko.DSSKey = paramiko.RSAKey
+
 from sshtunnel import SSHTunnelForwarder
-import tempfile
+import io
 import os
 import re
 
@@ -32,11 +37,44 @@ app.add_middleware(
 )
 
 def sanitize_error(err: Exception) -> str:
-    """Sanitizes database exception strings to prevent credential leakage."""
+    """Sanitizes database and SSH exception strings to prevent credential or key leakage."""
     msg = str(err)
-    if "password=" in msg:
-        msg = re.sub(r'password=\S+', 'password=***', msg)
+    msg = re.sub(r'password=\S+', 'password=***', msg, flags=re.IGNORECASE)
+    msg = re.sub(r'password\s*:\s*\S+', 'password: ***', msg, flags=re.IGNORECASE)
+    msg = re.sub(r'-----BEGIN[^-]+PRIVATE KEY-----[^-]+-----END[^-]+PRIVATE KEY-----', '[REDACTED PRIVATE KEY]', msg, flags=re.DOTALL)
     return msg
+
+def load_ssh_key(key_str: str) -> Any:
+    """
+    Loads an SSH private key in-memory directly as a paramiko.PKey without writing to disk.
+    Supports RSA, OpenSSH (Ed25519), and ECDSA key formats in pure volatile memory.
+    """
+    cleaned = key_str.replace('\r\n', '\n').strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="SSH private key is empty.")
+    
+    key_classes = [paramiko.RSAKey]
+    if hasattr(paramiko, 'Ed25519Key'):
+        key_classes.append(paramiko.Ed25519Key)
+    if hasattr(paramiko, 'ECDSAKey'):
+        key_classes.append(paramiko.ECDSAKey)
+
+    for k_cls in key_classes:
+        try:
+            pkey = k_cls.from_private_key(io.StringIO(cleaned))
+            return pkey
+        except paramiko.ssh_exception.PasswordRequiredException:
+            raise HTTPException(
+                status_code=400,
+                detail="The provided SSH key is encrypted with a passphrase. Please use an unencrypted private key or remove the passphrase."
+            )
+        except Exception:
+            continue
+            
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid SSH private key. Expected a valid PEM/OpenSSH format (e.g. BEGIN RSA / OPENSSH / EC PRIVATE KEY)."
+    )
 
 class ConnectionRequest(BaseModel):
     type: str # 'local', 'ssh', 'aws', 'azure', 'oracle', 'supabase', 'other'
@@ -46,6 +84,7 @@ class ConnectionRequest(BaseModel):
     user: str = Field(..., max_length=128)
     pass_: str = Field(..., max_length=512)
     sshHost: Optional[str] = Field(None, max_length=255)
+    sshPort: Optional[str] = Field("22", max_length=10)
     sshUser: Optional[str] = Field(None, max_length=128)
     sshKey: Optional[str] = None # PEM content in memory only
     testMode: Optional[str] = 'full' # 'full' or 'ssh_only'
@@ -76,44 +115,78 @@ class SyncScriptRequest(BaseModel):
 
 def establish_connection(req: ConnectionRequest):
     """
-    Establishes a database connection and an optional ephemeral SSH tunnel.
-    SSH keys are stored in memory and written strictly to ephemeral temp files
-    which are instantly unlinked upon handshake completion.
+    Establishes an enterprise database connection and optional ephemeral SSH tunnel.
+    SSH keys are stored in volatile memory only and never persisted to disk.
+    If database connection fails, the SSH tunnel is immediately torn down to prevent leaks.
     """
     tunnel = None
-    db_host = req.host
-    db_port = int(req.port)
+    db_host = req.host.strip()
+    db_port = int(req.port.strip())
     
     if req.sshHost and req.sshUser and req.sshKey:
-        fd, path = tempfile.mkstemp()
+        ssh_host = req.sshHost.strip()
+        ssh_port = 22
+        if req.sshPort:
+            try:
+                ssh_port = int(req.sshPort.strip())
+            except ValueError:
+                ssh_port = 22
+        elif ':' in ssh_host:
+            parts = ssh_host.split(':', 1)
+            ssh_host = parts[0].strip()
+            try:
+                ssh_port = int(parts[1].strip())
+            except ValueError:
+                ssh_port = 22
+
+        pkey = load_ssh_key(req.sshKey)
         try:
-            with os.fdopen(fd, 'w') as tmp:
-                tmp.write(req.sshKey)
-            
             tunnel = SSHTunnelForwarder(
-                (req.sshHost, 22),
-                ssh_username=req.sshUser,
-                ssh_pkey=path,
-                remote_bind_address=(req.host, int(req.port))
+                (ssh_host, ssh_port),
+                ssh_username=req.sshUser.strip(),
+                ssh_pkey=pkey,
+                ssh_config_file=None,
+                allow_agent=False,
+                host_pkey_directories=[],
+                remote_bind_address=(req.host.strip(), int(req.port.strip())),
+                set_keepalive=10.0
             )
             tunnel.start()
             db_host = '127.0.0.1'
             db_port = tunnel.local_bind_port
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+        except HTTPException:
+            raise
+        except Exception as e:
+            if tunnel:
+                try: tunnel.stop()
+                except Exception: pass
+            raise HTTPException(
+                status_code=400, 
+                detail=f"SSH Tunnel Handshake Failed ({ssh_host}:{ssh_port}): {sanitize_error(e)}"
+            )
             
     if req.testMode == 'ssh_only':
         return None, tunnel
 
-    conn = psycopg2.connect(
-        host=db_host,
-        port=db_port,
-        dbname=req.dbName,
-        user=req.user,
-        password=req.pass_
-    )
-    return conn, tunnel
+    try:
+        conn = psycopg2.connect(
+            host=db_host,
+            port=db_port,
+            dbname=req.dbName.strip(),
+            user=req.user.strip(),
+            password=req.pass_,
+            connect_timeout=15,
+            sslmode='prefer'
+        )
+        return conn, tunnel
+    except Exception as e:
+        if tunnel:
+            try: tunnel.stop()
+            except Exception: pass
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Database Connection Failed ({req.host}:{req.port}/{req.dbName}): {sanitize_error(e)}"
+        )
 
 @app.post("/api/test-connection")
 async def test_connection(req: ConnectionRequest):
@@ -129,11 +202,17 @@ async def test_connection(req: ConnectionRequest):
         cur.fetchone()
         cur.close()
         return {"status": "success", "message": "Database connection verified successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=sanitize_error(e))
     finally:
-        if conn: conn.close()
-        if tunnel: tunnel.stop()
+        if conn:
+            try: conn.close()
+            except Exception: pass
+        if tunnel:
+            try: tunnel.stop()
+            except Exception: pass
 
 @app.post("/api/compare/pre-flight")
 async def pre_flight_counts(req: PreFlightRequest):
@@ -169,13 +248,23 @@ async def pre_flight_counts(req: PreFlightRequest):
             "eta_seconds": eta_seconds,
             "total_objects": total_objects
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=sanitize_error(e))
     finally:
-        if source_conn: source_conn.close()
-        if source_tunnel: source_tunnel.stop()
-        if target_conn: target_conn.close()
-        if target_tunnel: target_tunnel.stop()
+        if source_conn:
+            try: source_conn.close()
+            except Exception: pass
+        if source_tunnel:
+            try: source_tunnel.stop()
+            except Exception: pass
+        if target_conn:
+            try: target_conn.close()
+            except Exception: pass
+        if target_tunnel:
+            try: target_tunnel.stop()
+            except Exception: pass
 
 @app.post("/api/compare/ddl")
 async def compare_ddl(req: CompareRequest):
@@ -197,13 +286,23 @@ async def compare_ddl(req: CompareRequest):
             "source_snap": source_snap,
             "target_snap": target_snap
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=sanitize_error(e))
     finally:
-        if source_conn: source_conn.close()
-        if source_tunnel: source_tunnel.stop()
-        if target_conn: target_conn.close()
-        if target_tunnel: target_tunnel.stop()
+        if source_conn:
+            try: source_conn.close()
+            except Exception: pass
+        if source_tunnel:
+            try: source_tunnel.stop()
+            except Exception: pass
+        if target_conn:
+            try: target_conn.close()
+            except Exception: pass
+        if target_tunnel:
+            try: target_tunnel.stop()
+            except Exception: pass
 
 @app.post("/api/compare/data")
 async def compare_data_endpoint(req: DataCompareRequest):
@@ -233,13 +332,23 @@ async def compare_data_endpoint(req: DataCompareRequest):
             "status": "success",
             "data_diff": data_diff
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=sanitize_error(e))
     finally:
-        if source_conn: source_conn.close()
-        if source_tunnel: source_tunnel.stop()
-        if target_conn: target_conn.close()
-        if target_tunnel: target_tunnel.stop()
+        if source_conn:
+            try: source_conn.close()
+            except Exception: pass
+        if source_tunnel:
+            try: source_tunnel.stop()
+            except Exception: pass
+        if target_conn:
+            try: target_conn.close()
+            except Exception: pass
+        if target_tunnel:
+            try: target_tunnel.stop()
+            except Exception: pass
 
 @app.post("/api/generate-sync-script")
 async def generate_sync_script_endpoint(req: SyncScriptRequest):

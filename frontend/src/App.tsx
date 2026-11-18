@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { 
   Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, 
   CheckCircle2, XCircle, TerminalSquare, Clock, Filter, Copy, Check, Download, 
-  Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2, Undo2
+  Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2, Undo2, Key
 } from 'lucide-react';
 
 type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
@@ -20,9 +20,12 @@ interface ConnectionState {
   pass: string;
   oracleService?: string;
   sshHost?: string;
+  sshPort?: string;
   sshUser?: string;
   sshKey?: File | null;
   testStatus: TestStatus;
+  sshStatus?: 'idle' | 'success' | 'error';
+  errorMessage?: string;
 }
 
 const getEmptyState = (provider: ProviderType = 'aws'): ConnectionState => ({
@@ -35,9 +38,12 @@ const getEmptyState = (provider: ProviderType = 'aws'): ConnectionState => ({
   pass: '',
   oracleService: '',
   sshHost: '',
+  sshPort: '22',
   sshUser: '',
   sshKey: null,
-  testStatus: 'idle'
+  testStatus: 'idle',
+  sshStatus: 'idle',
+  errorMessage: ''
 });
 
 interface PreFlightData {
@@ -169,6 +175,7 @@ export default function App() {
       user: data.user,
       pass_: data.pass,
       sshHost: data.method === 'ssh' ? data.sshHost : null,
+      sshPort: data.method === 'ssh' ? (data.sshPort || '22') : null,
       sshUser: data.method === 'ssh' ? data.sshUser : null,
       sshKey: data.method === 'ssh' ? pemText : null,
       testMode: 'full'
@@ -176,7 +183,7 @@ export default function App() {
   };
 
   const testOneConnection = async (data: ConnectionState, setData: (d: ConnectionState) => void) => {
-    setData({ ...data, testStatus: 'testing_db' });
+    setData({ ...data, testStatus: 'testing_db', errorMessage: '' });
     try {
       const payload = await preparePayload(data);
       const res = await fetch('http://localhost:8000/api/test-connection', {
@@ -188,10 +195,9 @@ export default function App() {
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson.detail || 'Connection failed');
       }
-      setData({ ...data, testStatus: 'success' });
-    } catch (err) {
-      console.error("Test connection error:", err);
-      setData({ ...data, testStatus: 'error' });
+      setData({ ...data, testStatus: 'success', errorMessage: '' });
+    } catch (err: any) {
+      setData({ ...data, testStatus: 'error', errorMessage: err.message || 'Connection failed' });
     }
   };
 
@@ -1806,7 +1812,11 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
   };
 
   const handleTestConnection = async (type: 'ssh_only' | 'full') => {
-    onChange({ ...data, testStatus: type === 'ssh_only' ? 'testing_ssh' : 'testing_db' });
+    onChange({ 
+      ...data, 
+      testStatus: type === 'ssh_only' ? 'testing_ssh' : 'testing_db',
+      errorMessage: '' 
+    });
     try {
       let pemText = '';
       if (data.sshKey) {
@@ -1821,6 +1831,7 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         user: data.user,
         pass_: data.pass,
         sshHost: data.method === 'ssh' ? data.sshHost : null,
+        sshPort: data.method === 'ssh' ? (data.sshPort || '22') : null,
         sshUser: data.method === 'ssh' ? data.sshUser : null,
         sshKey: data.method === 'ssh' ? pemText : null,
         testMode: type
@@ -1836,10 +1847,18 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         const errJson = await res.json().catch(() => ({}));
         throw new Error(errJson.detail || 'Connection failed');
       }
-      onChange({ ...data, testStatus: type === 'full' ? 'success' : 'idle' });
-    } catch (err) {
-      console.error("Test connection error:", err);
-      onChange({ ...data, testStatus: 'error' });
+      if (type === 'ssh_only') {
+        onChange({ ...data, testStatus: 'idle', sshStatus: 'success', errorMessage: '' });
+      } else {
+        onChange({ ...data, testStatus: 'success', sshStatus: 'success', errorMessage: '' });
+      }
+    } catch (err: any) {
+      onChange({ 
+        ...data, 
+        testStatus: 'error', 
+        sshStatus: type === 'ssh_only' ? 'error' : data.sshStatus,
+        errorMessage: err.message || 'Connection failed' 
+      });
     }
   };
 
@@ -1946,27 +1965,78 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
         {data.method === 'ssh' && (
           <div className="pt-4 border-t border-slate-700/50 space-y-4 animate-in fade-in slide-in-from-top-2">
             <h4 className="text-sm font-medium text-slate-300 flex items-center gap-2">
-              <TerminalSquare size={14} className="text-slate-500"/> SSH Configuration
+              <TerminalSquare size={14} className="text-slate-500"/> SSH Bastion Configuration
             </h4>
-            <div className="grid grid-cols-2 gap-4">
-              <div>
+            <div className="grid grid-cols-12 gap-3">
+              <div className="col-span-6">
                 <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">SSH Host</label>
-                <input type="text" value={data.sshHost || ''} onChange={e => onChange({...data, sshHost: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder:text-slate-600" placeholder="bastion.env.com" />
+                <input 
+                  type="text" 
+                  value={data.sshHost || ''} 
+                  onChange={e => onChange({...data, sshHost: e.target.value, testStatus: 'idle', errorMessage: ''})} 
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder:text-slate-600" 
+                  placeholder="bastion.example.com" 
+                />
               </div>
-              <div>
+              <div className="col-span-2">
+                <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Port</label>
+                <input 
+                  type="text" 
+                  value={data.sshPort || '22'} 
+                  onChange={e => onChange({...data, sshPort: e.target.value, testStatus: 'idle', errorMessage: ''})} 
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all text-center" 
+                  placeholder="22" 
+                />
+              </div>
+              <div className="col-span-4">
                 <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">SSH User</label>
-                <input type="text" value={data.sshUser || ''} onChange={e => onChange({...data, sshUser: e.target.value, testStatus: 'idle'})} className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder:text-slate-600" placeholder="ec2-user" />
+                <input 
+                  type="text" 
+                  value={data.sshUser || ''} 
+                  onChange={e => onChange({...data, sshUser: e.target.value, testStatus: 'idle', errorMessage: ''})} 
+                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-orange-500 focus:border-orange-500 outline-none transition-all placeholder:text-slate-600" 
+                  placeholder="ec2-user" 
+                />
               </div>
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wider">Identity File (.pem)</label>
-              <div className="border border-dashed border-slate-600 rounded-lg p-4 text-center hover:bg-slate-700/30 transition-colors cursor-pointer group bg-slate-900" onClick={(e) => (e.currentTarget.querySelector('input') as HTMLInputElement).click()}>
-                <span className="text-sm text-slate-400 group-hover:text-slate-300 transition-colors">
-                  {data.sshKey ? `Selected: ${data.sshKey.name}` : 'Click to upload .pem key'}
-                </span>
-                <input type="file" className="hidden" accept=".pem,.key" onChange={(e) => {
-                  onChange({...data, sshKey: e.target.files?.[0] || null, testStatus: 'idle'});
-                }} />
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="block text-xs font-medium text-slate-400 uppercase tracking-wider">Identity File (.pem / private key)</label>
+                {data.sshKey && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onChange({...data, sshKey: null, testStatus: 'idle', errorMessage: ''});
+                    }}
+                    className="text-[11px] text-red-400 hover:text-red-300 transition-colors flex items-center gap-1 cursor-pointer"
+                  >
+                    <XCircle size={12} /> Clear Key
+                  </button>
+                )}
+              </div>
+              <div 
+                className={`border border-dashed rounded-lg p-3 text-center transition-colors cursor-pointer group bg-slate-900 ${
+                  data.sshKey ? 'border-orange-500/50 bg-orange-950/10' : 'border-slate-700 hover:border-slate-500 hover:bg-slate-800/30'
+                }`}
+                onClick={(e) => (e.currentTarget.querySelector('input') as HTMLInputElement).click()}
+              >
+                <div className="flex items-center justify-center gap-2 text-sm">
+                  <Key size={15} className={data.sshKey ? 'text-orange-400' : 'text-slate-500'} />
+                  <span className={data.sshKey ? 'text-orange-300 font-mono text-xs truncate max-w-[280px]' : 'text-slate-400 group-hover:text-slate-300'}>
+                    {data.sshKey ? `${data.sshKey.name} (${(data.sshKey.size / 1024).toFixed(1)} KB)` : 'Click to select .pem or private key'}
+                  </span>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-1">Read in-memory only — never saved to disk</p>
+                <input 
+                  type="file" 
+                  className="hidden" 
+                  accept=".pem,.key,.id_rsa,.id_ed25519,*" 
+                  onChange={(e) => {
+                    const file = e.target.files?.[0] || null;
+                    onChange({...data, sshKey: file, testStatus: 'idle', errorMessage: ''});
+                  }} 
+                />
               </div>
             </div>
           </div>
@@ -1974,13 +2044,32 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
       </div>
 
       <div className="pt-6 mt-6 border-t border-slate-700/50 space-y-3 shrink-0">
+        {data.testStatus === 'error' && data.errorMessage && (
+          <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-xs text-red-300 flex items-start gap-2 animate-in fade-in">
+            <XCircle size={15} className="text-red-400 shrink-0 mt-0.5" />
+            <div className="flex-1 break-words font-mono text-[11px] leading-relaxed">
+              {data.errorMessage}
+            </div>
+          </div>
+        )}
+
         {data.method === 'ssh' && (
           <button
             onClick={() => handleTestConnection('ssh_only')}
             disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
-            className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors py-2.5 rounded-lg text-sm font-medium border border-slate-700 cursor-pointer"
+            className={`w-full flex items-center justify-center gap-2 transition-colors py-2 rounded-lg text-xs font-medium border cursor-pointer ${
+              data.sshStatus === 'success' 
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' 
+                : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700 disabled:opacity-50 disabled:cursor-not-allowed'
+            }`}
           >
-            {data.testStatus === 'testing_ssh' ? <><Loader2 size={16} className="animate-spin" /> Testing SSH...</> : 'Test SSH Tunnel'}
+            {data.testStatus === 'testing_ssh' ? (
+              <><Loader2 size={14} className="animate-spin" /> Verifying SSH Bastion Tunnel...</>
+            ) : data.sshStatus === 'success' ? (
+              <><CheckCircle2 size={14} className="text-emerald-400" /> SSH Tunnel Verified</>
+            ) : (
+              <><TerminalSquare size={14} className="text-slate-400" /> Test SSH Bastion Only</>
+            )}
           </button>
         )}
         
@@ -1989,14 +2078,14 @@ function ConnectionCard({ title, data, onChange }: { title: string, data: Connec
           disabled={!isFilled() || data.testStatus === 'testing_ssh' || data.testStatus === 'testing_db'}
           className={`w-full flex items-center justify-center gap-2 transition-colors py-2.5 rounded-lg text-sm font-medium cursor-pointer ${
             data.testStatus === 'success' ? 'bg-green-500/10 text-green-400 border border-green-500/30' : 
-            data.testStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/30' :
+            data.testStatus === 'error' ? 'bg-red-500/10 text-red-400 border border-red-500/30 hover:bg-red-500/20' :
             'bg-slate-700 hover:bg-slate-600 disabled:opacity-50 disabled:cursor-not-allowed'
           }`}
         >
-          {data.testStatus === 'idle' && 'Test Connection'}
-          {data.testStatus === 'testing_db' && <><Loader2 size={16} className="animate-spin" /> Testing DB...</>}
+          {data.testStatus === 'idle' && 'Test DB Connection'}
+          {data.testStatus === 'testing_db' && <><Loader2 size={16} className="animate-spin" /> Connecting to Database...</>}
           {data.testStatus === 'success' && <><CheckCircle2 size={16} /> Connection Successful</>}
-          {data.testStatus === 'error' && <><XCircle size={16} /> Connection Failed</>}
+          {data.testStatus === 'error' && <><XCircle size={16} /> Connection Failed (Retry)</>}
         </button>
       </div>
 

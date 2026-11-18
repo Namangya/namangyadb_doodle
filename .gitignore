@@ -13,3 +13,13 @@ frontend/dist/
 .DS_Store
 Thumbs.db
 
+# Secrets & Private Keys
+*.pem
+*.key
+*.id_rsa
+*.id_ed25519
+*.ppk
+.env
+.env.*
+
+
