@@ -14,7 +14,7 @@ from data_inspector import compare_all_data
 from sync_generator import generate_sync_script
 
 app = FastAPI(
-    title="NamangyaDB Compare API",
+    title="DB Compare API",
     description="Enterprise-grade zero-retention database schema and data migration engine.",
     version="2.0.0"
 )

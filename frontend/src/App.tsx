@@ -8,7 +8,7 @@ import {
 type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
 type ConnectionMethod = 'direct' | 'ssh';
 type TestStatus = 'idle' | 'testing_ssh' | 'testing_db' | 'success' | 'error';
-type ViewState = 'setup' | 'preflight' | 'comparing' | 'results' | 'about' | 'privacy' | 'terms' | 'contact';
+type ViewState = 'setup' | 'preflight' | 'comparing' | 'results';
 
 interface ConnectionState {
   provider: ProviderType;
@@ -378,7 +378,7 @@ export default function App() {
             <div className="p-2 bg-orange-500/10 rounded-lg text-orange-400">
               <ArrowRightLeft size={24} />
             </div>
-            <h1 className="text-xl font-semibold tracking-tight">NamangyaDB <span className="text-slate-500 font-normal">Compare</span></h1>
+            <h1 className="text-xl font-semibold tracking-tight">DB <span className="text-slate-500 font-normal">Compare</span></h1>
           </div>
           <div className="flex items-center gap-4 text-sm">
             <div className="relative group">
@@ -1160,81 +1160,16 @@ export default function App() {
           </div>
         )}
 
-        {/* Legal Pages */}
-        {['about', 'privacy', 'terms', 'contact'].includes(view) && (
-          <div className="max-w-3xl mx-auto space-y-6 bg-slate-800/40 p-8 rounded-2xl border border-slate-700/50 animate-in fade-in slide-in-from-bottom-4">
-            <button onClick={() => setView('setup')} className="text-sm text-orange-400 hover:text-orange-300 transition-colors mb-4 block cursor-pointer">
-              &larr; Back to Tool
-            </button>
-            
-            {view === 'about' && (
-              <div className="prose prose-invert prose-orange max-w-none">
-                <h2>About NamangyaDB</h2>
-                <p>NamangyaDB is an enterprise-grade database management and comparison utility engineered for modern cloud architectures. Built by database professionals for database professionals, our mission is to eliminate the friction and uncertainty associated with schema migrations across disparate environments.</p>
-                <p>We support all major cloud providers, including AWS, Azure, Oracle Cloud, and Supabase, as well as local instances. Our platform is designed with a core philosophy of extreme security and zero data residency.</p>
-              </div>
-            )}
-
-            {view === 'privacy' && (
-              <div className="prose prose-invert prose-orange max-w-none">
-                <h2>Privacy Policy & Data Retention</h2>
-                <p>At NamangyaDB, your data security is our highest priority. Unlike traditional SaaS database tools, we operate under a strict <strong>Zero-Retention Policy</strong> by default.</p>
-                <h3>1. Zero Data Retention</h3>
-                <p>When you utilize our comparison engine, we do not store, log, or persist any of the following to disk:</p>
-                <ul>
-                  <li>Database connection strings, hostnames, or ports.</li>
-                  <li>Database usernames and passwords.</li>
-                  <li>SSH Tunnel `.pem` or `.key` identity files.</li>
-                  <li>Any schema (DDL) or row-level data extracted during comparison.</li>
-                </ul>
-                <p>All operations are performed entirely in-memory (RAM) and are completely wiped the moment your session is terminated or the browser is closed. SSH keys are written to ephemeral, OS-level secure temp files strictly for the duration of the tunnel handshake and are immediately unlinked from the filesystem.</p>
-              </div>
-            )}
-
-            {view === 'terms' && (
-              <div className="prose prose-invert prose-orange max-w-none">
-                <h2>Terms and Conditions</h2>
-                <p>By accessing or using the NamangyaDB comparison tool, you agree to be bound by these Terms and Conditions.</p>
-                <h3>1. Use of Service</h3>
-                <p>You agree to only connect to databases and infrastructure for which you have explicit authorization. NamangyaDB is provided "as is", without warranty of any kind, express or implied.</p>
-                <h3>2. Limitation of Liability</h3>
-                <p>In no event shall the developers or owners of NamangyaDB be liable for any claim, damages, data loss, downtime, or other liability, whether in an action of contract, tort or otherwise, arising from, out of or in connection with the software or the use or other dealings in the software. It is your responsibility to verify any generated sync scripts before applying them to a production environment.</p>
-              </div>
-            )}
-
-            {view === 'contact' && (
-              <div className="prose prose-invert prose-orange max-w-none">
-                <h2>Contact Us</h2>
-                <p>Have questions about NamangyaDB, require enterprise support, or want to report an issue? We&apos;d love to hear from you.</p>
-                <div className="bg-slate-900/50 p-6 rounded-lg border border-slate-700 mt-6">
-                  <p className="m-0 text-slate-300"><strong>Email:</strong> support@namangyadb.com</p>
-                  <p className="m-0 text-slate-300 mt-2"><strong>Enterprise Sales:</strong> enterprise@namangyadb.com</p>
-                  <p className="m-0 text-slate-300 mt-2"><strong>Security Disclosures:</strong> security@namangyadb.com</p>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-
       </main>
 
       {/* Footer */}
       <footer className="border-t border-slate-800 bg-slate-900/50 shrink-0">
-        <div className="max-w-7xl mx-auto px-4 py-6 flex flex-col md:flex-row items-center justify-between text-xs text-slate-500 gap-4">
+        <div className="max-w-7xl mx-auto px-4 py-6 flex items-center justify-between text-xs text-slate-500">
           <div className="flex items-center gap-2">
             <span className="font-mono bg-slate-800 px-2.5 py-1 rounded-md text-slate-300 border border-slate-700 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
               Session: Active (RAM Only)
             </span>
-          </div>
-          <div className="flex items-center gap-6">
-            <button onClick={() => setView('about')} className="hover:text-orange-400 transition-colors cursor-pointer">About Us</button>
-            <button onClick={() => setView('privacy')} className="hover:text-orange-400 transition-colors cursor-pointer">Privacy Policy</button>
-            <button onClick={() => setView('terms')} className="hover:text-orange-400 transition-colors cursor-pointer">Terms</button>
-            <button onClick={() => setView('contact')} className="hover:text-orange-400 transition-colors cursor-pointer">Contact Us</button>
-          </div>
-          <div className="text-slate-600">
-            &copy; {new Date().getFullYear()} NamangyaDB. All rights reserved.
           </div>
         </div>
       </footer>

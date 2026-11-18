@@ -467,7 +467,7 @@ def generate_sync_script(
     
     header = [
         "-- ====================================================================",
-        "-- NamangyaDB Migration & Synchronization Script",
+        "-- DB Compare Migration & Synchronization Script",
         f"-- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         "-- Direction: Target Database -> Synchronized to Match Source Database",
         f"-- Safe Mode: {'ENABLED (Destructive operations commented)' if safe_mode else 'DISABLED'}",

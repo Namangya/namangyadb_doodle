@@ -1,6 +1,6 @@
 <div align="center">
-  <img src="https://img.icons8.com/color/96/000000/database-restore.png" width="80" alt="NamangyaDB Logo"/>
-  <h1>NamangyaDB Compare</h1>
+  <img src="https://img.icons8.com/color/96/000000/database-restore.png" width="80" alt="DB Compare Logo"/>
+  <h1>DB Compare</h1>
   <p><b>An enterprise-grade, zero-retention database schema and data migration utility.</b></p>
   
   [![React](https://img.shields.io/badge/React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB)](#)
@@ -13,15 +13,15 @@
 
 ## 🌟 Overview
 
-NamangyaDB Compare is a production-ready utility designed to identify Data Definition Language (DDL) drift and row-level data inconsistencies between any two database environments (**Source** vs **Target**).
+DB Compare is a production-ready utility designed to identify Data Definition Language (DDL) drift and row-level data inconsistencies between any two database environments (**Source** vs **Target**).
 
-Built for security-conscious organizations, NamangyaDB operates completely in-memory with a strict **Zero-Retention Policy**. No credentials, SSH private keys, schemas, or row data are ever persisted to disk.
+Built for security-conscious organizations, DB Compare operates completely in-memory with a strict **Zero-Retention Policy**. No credentials, SSH private keys, schemas, or row data are ever persisted to disk.
 
 ---
 
 ## ✨ Supported DDL Schema Objects
 
-NamangyaDB provides comprehensive inspection, delta diffing, and migration script generation across all major PostgreSQL schema objects:
+DB Compare provides comprehensive inspection, delta diffing, and migration script generation across all major PostgreSQL schema objects:
 
 | Object Type             | Description                  | Granular Inspection Attributes                                                                 |
 | ----------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
