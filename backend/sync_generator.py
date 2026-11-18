@@ -513,3 +513,344 @@ def generate_sync_script(
             "has_data": bool(data_sql.strip())
         }
     }
+
+def generate_ddl_rollback_script(
+    source_snap: Dict[str, Any],
+    target_snap: Dict[str, Any],
+    diffs: List[Dict[str, Any]],
+    safe_mode: bool = True
+) -> str:
+    """
+    Generates PostgreSQL DDL statements to revert Target database modifications,
+    restoring Target's original pre-migration schema definitions.
+    """
+    lines = []
+    target_tables = target_snap.get('tables', {})
+    
+    # 1. Revert Views (Drop replaced views and restore original target definitions)
+    view_lines = []
+    target_views = target_snap.get('views', {})
+    for d in diffs:
+        if d.get('object_type') == 'view':
+            v_name = d.get('name')
+            status = d.get('status')
+            if status == 'mismatch' and v_name in target_views:
+                v_def = target_views[v_name].strip()
+                if not v_def.endswith(';'): v_def += ';'
+                view_lines.append(f"DROP VIEW IF EXISTS {quote_ident(v_name)} CASCADE;")
+                view_lines.append(f"CREATE OR REPLACE VIEW {quote_ident(v_name)} AS\n{v_def}")
+            elif status == 'missing_target':
+                view_lines.append(f"-- [FORWARD CREATED VIEW] Revert by dropping view:")
+                view_lines.append(f"-- DROP VIEW IF EXISTS {quote_ident(v_name)} CASCADE;")
+    if view_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 1. RESTORE ORIGINAL VIEWS")
+        lines.append("-- ===========================================")
+        lines.extend(view_lines)
+        lines.append("")
+
+    # 2. Revert Materialized Views
+    mv_lines = []
+    target_mvs = target_snap.get('materialized_views', {})
+    for d in diffs:
+        if d.get('object_type') == 'materialized_view':
+            mv_name = d.get('name')
+            status = d.get('status')
+            if status == 'mismatch' and mv_name in target_mvs:
+                mv_def = target_mvs[mv_name].strip()
+                if not mv_def.endswith(';'): mv_def += ';'
+                mv_lines.append(f"DROP MATERIALIZED VIEW IF EXISTS {quote_ident(mv_name)};")
+                mv_lines.append(f"CREATE MATERIALIZED VIEW {quote_ident(mv_name)} AS\n{mv_def}")
+            elif status == 'missing_target':
+                mv_lines.append(f"-- [FORWARD CREATED MATVIEW] Revert by dropping materialized view:")
+                mv_lines.append(f"-- DROP MATERIALIZED VIEW IF EXISTS {quote_ident(mv_name)};")
+    if mv_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 2. RESTORE ORIGINAL MATERIALIZED VIEWS")
+        lines.append("-- ===========================================")
+        lines.extend(mv_lines)
+        lines.append("")
+
+    # 3. Revert Functions
+    fn_lines = []
+    target_fns = target_snap.get('functions', {})
+    for d in diffs:
+        if d.get('object_type') == 'function':
+            fn_sig = d.get('name')
+            status = d.get('status')
+            if status == 'mismatch' and fn_sig in target_fns:
+                fn_def = target_fns[fn_sig].strip()
+                if not fn_def.endswith(';'): fn_def += ';'
+                fn_lines.append(fn_def)
+            elif status == 'missing_target':
+                fn_lines.append(f"-- [FORWARD CREATED FUNCTION] Revert by dropping function:")
+                fn_lines.append(f"-- DROP FUNCTION IF EXISTS {fn_sig};")
+    if fn_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 3. RESTORE ORIGINAL FUNCTIONS")
+        lines.append("-- ===========================================")
+        lines.extend(fn_lines)
+        lines.append("")
+
+    # 4. Revert Procedures
+    proc_lines = []
+    target_procs = target_snap.get('procedures', {})
+    for d in diffs:
+        if d.get('object_type') == 'procedure':
+            p_sig = d.get('name')
+            status = d.get('status')
+            if status == 'mismatch' and p_sig in target_procs:
+                p_def = target_procs[p_sig].strip()
+                if not p_def.endswith(';'): p_def += ';'
+                proc_lines.append(p_def)
+            elif status == 'missing_target':
+                proc_lines.append(f"-- [FORWARD CREATED PROCEDURE] Revert by dropping procedure:")
+                proc_lines.append(f"-- DROP PROCEDURE IF EXISTS {p_sig};")
+    if proc_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 4. RESTORE ORIGINAL STORED PROCEDURES")
+        lines.append("-- ===========================================")
+        lines.extend(proc_lines)
+        lines.append("")
+
+    # 5. Revert Triggers
+    trig_lines = []
+    target_trigs = target_snap.get('triggers', {})
+    for d in diffs:
+        if d.get('object_type') == 'trigger':
+            trig_name = d.get('name')
+            status = d.get('status')
+            if status == 'mismatch' and trig_name in target_trigs:
+                t_obj = target_trigs[trig_name]
+                t_def = t_obj.get('def') if isinstance(t_obj, dict) else str(t_obj)
+                t_table = t_obj.get('table') if isinstance(t_obj, dict) else None
+                if t_table:
+                    trig_lines.append(f"DROP TRIGGER IF EXISTS {quote_ident(trig_name)} ON {quote_ident(t_table)};")
+                if not t_def.strip().endswith(';'): t_def += ';'
+                trig_lines.append(t_def)
+            elif status == 'missing_target':
+                trig_lines.append(f"-- [FORWARD CREATED TRIGGER] Revert by dropping trigger:")
+                trig_lines.append(f"-- DROP TRIGGER IF EXISTS {quote_ident(trig_name)} ON <table_name>;")
+    if trig_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 5. RESTORE ORIGINAL TRIGGERS")
+        lines.append("-- ===========================================")
+        lines.extend(trig_lines)
+        lines.append("")
+
+    # 6. Revert Columns & Constraints
+    col_lines = []
+    for d in diffs:
+        if d.get('object_type') == 'column':
+            name_parts = d.get('name', '').split('.')
+            if len(name_parts) == 2:
+                t_name, c_name = name_parts
+                status = d.get('status')
+                raw = d.get('raw_data', {})
+                if status == 'mismatch':
+                    kind = raw.get('mismatch_kind')
+                    t_col = raw.get('target_col') or target_tables.get(t_name, {}).get('columns', {}).get(c_name, {})
+                    if kind == 'type' and t_col.get('type'):
+                        orig_type = t_col['type']
+                        col_lines.append(f"ALTER TABLE {quote_ident(t_name)} ALTER COLUMN {quote_ident(c_name)} TYPE {orig_type} USING {quote_ident(c_name)}::{orig_type};")
+                    elif kind == 'default':
+                        orig_def = t_col.get('default')
+                        if orig_def:
+                            col_lines.append(f"ALTER TABLE {quote_ident(t_name)} ALTER COLUMN {quote_ident(c_name)} SET DEFAULT {orig_def};")
+                        else:
+                            col_lines.append(f"ALTER TABLE {quote_ident(t_name)} ALTER COLUMN {quote_ident(c_name)} DROP DEFAULT;")
+                    elif kind == 'nullable':
+                        if t_col.get('nullable') == 'NO':
+                            col_lines.append(f"ALTER TABLE {quote_ident(t_name)} ALTER COLUMN {quote_ident(c_name)} SET NOT NULL;")
+                        else:
+                            col_lines.append(f"ALTER TABLE {quote_ident(t_name)} ALTER COLUMN {quote_ident(c_name)} DROP NOT NULL;")
+                elif status == 'missing_target':
+                    col_lines.append(f"-- [FORWARD ADDED COLUMN] Revert by dropping column:")
+                    col_lines.append(f"-- ALTER TABLE {quote_ident(t_name)} DROP COLUMN IF EXISTS {quote_ident(c_name)};")
+    if col_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 6. RESTORE ORIGINAL COLUMNS")
+        lines.append("-- ===========================================")
+        lines.extend(col_lines)
+        lines.append("")
+
+    # 7. Revert Indexes
+    idx_lines = []
+    for d in diffs:
+        if d.get('object_type') == 'index':
+            name_parts = d.get('name', '').split('.')
+            idx_name = name_parts[1] if len(name_parts) == 2 else d.get('name')
+            status = d.get('status')
+            raw = d.get('raw_data', {})
+            t_name = raw.get('table') or (name_parts[0] if len(name_parts) == 2 else None)
+            if status == 'mismatch':
+                idx_lines.append(f"DROP INDEX IF EXISTS {quote_ident(idx_name)};")
+                t_def = raw.get('target_def', '')
+                if t_def:
+                    if not t_def.strip().endswith(';'): t_def += ';'
+                    idx_lines.append(t_def)
+            elif status == 'missing_target':
+                idx_lines.append(f"-- [FORWARD CREATED INDEX] Revert by dropping index:")
+                idx_lines.append(f"-- DROP INDEX IF EXISTS {quote_ident(idx_name)};")
+    if idx_lines:
+        lines.append("-- ===========================================")
+        lines.append("-- 7. RESTORE ORIGINAL INDEXES")
+        lines.append("-- ===========================================")
+        lines.extend(idx_lines)
+        lines.append("")
+
+    # 8. Revert Newly Created Tables & Sequences
+    obj_drops = []
+    for d in diffs:
+        if d.get('object_type') == 'table' and d.get('status') == 'missing_target':
+            t_name = d.get('name')
+            obj_drops.append(f"-- [FORWARD CREATED TABLE] Revert by dropping table:")
+            obj_drops.append(f"-- DROP TABLE IF EXISTS {quote_ident(t_name)} CASCADE;")
+        elif d.get('object_type') == 'sequence' and d.get('status') == 'missing_target':
+            s_name = d.get('name')
+            obj_drops.append(f"-- [FORWARD CREATED SEQUENCE] Revert by dropping sequence:")
+            obj_drops.append(f"-- DROP SEQUENCE IF EXISTS {quote_ident(s_name)};")
+        elif d.get('object_type') == 'role' and d.get('status') == 'missing_target':
+            r_name = d.get('name')
+            obj_drops.append(f"-- [FORWARD CREATED ROLE] Revert by dropping role:")
+            obj_drops.append(f"-- DROP ROLE IF EXISTS {quote_ident(r_name)};")
+        elif d.get('object_type') == 'grant' and d.get('status') == 'missing_target':
+            g_data = d.get('raw_data', {}).get('grant_data', {})
+            if g_data:
+                g_priv = g_data.get('privilege')
+                g_obj = g_data.get('object_name')
+                g_user = g_data.get('grantee')
+                obj_drops.append(f"-- [FORWARD GRANTED PRIVILEGE] Revert by revoking privilege:")
+                obj_drops.append(f"-- REVOKE {g_priv} ON {quote_ident(g_obj)} FROM {quote_ident(g_user)};")
+    if obj_drops:
+        lines.append("-- ===========================================")
+        lines.append("-- 8. REVERT NEWLY CREATED OBJECTS (COMMENTED FOR SAFETY)")
+        lines.append("-- ===========================================")
+        lines.extend(obj_drops)
+        lines.append("")
+
+    return "\n".join(lines)
+
+def generate_data_rollback_script(
+    data_diff: Dict[str, Any],
+    safe_mode: bool = True
+) -> str:
+    """
+    Generates SQL statements to rollback data changes applied to Target,
+    restoring Target's original row-level values.
+    """
+    lines = []
+    tables = data_diff.get('tables', {})
+    if not tables:
+        return ""
+    
+    lines.append("-- ===========================================")
+    lines.append("-- TARGET DATA ROLLBACK & RESTORATION")
+    lines.append("-- ===========================================")
+    
+    for t_name, t_info in tables.items():
+        if t_info.get('status') != 'drift_detected':
+            continue
+        
+        lines.append(f"\n-- Table: {t_name}")
+        common_cols = t_info.get('common_columns', [])
+        
+        # 1. Mismatched rows that were updated -> Revert to Target's original values
+        mismatches = t_info.get('sample_mismatches', [])
+        if mismatches:
+            lines.append(f"-- Restore original target values for updated rows ({len(mismatches)} sample rows)")
+            for item in mismatches:
+                pk_dict = item.get('pk', {})
+                t_vals = item.get('target_values', {})
+                if not pk_dict or not t_vals:
+                    continue
+                set_clauses = [f"{quote_ident(c)} = {format_val(v)}" for c, v in t_vals.items()]
+                where_clauses = [f"{quote_ident(k)} = {format_val(v)}" for k, v in pk_dict.items()]
+                lines.append(f"UPDATE {quote_ident(t_name)} SET {', '.join(set_clauses)} WHERE {' AND '.join(where_clauses)};")
+                
+        # 2. Rows that were newly inserted into Target -> Revert by deleting them
+        missing_target = t_info.get('sample_missing_in_target', [])
+        if missing_target:
+            lines.append(f"-- Remove rows inserted by forward migration ({len(missing_target)} sample rows)")
+            for item in missing_target:
+                pk_dict = item.get('pk', {})
+                if pk_dict:
+                    where_clauses = [f"{quote_ident(k)} = {format_val(v)}" for k, v in pk_dict.items()]
+                    lines.append(f"DELETE FROM {quote_ident(t_name)} WHERE {' AND '.join(where_clauses)};")
+                    
+        # 3. Target rows that would have been deleted by destructive forward migration -> Restore by inserting
+        missing_source = t_info.get('sample_missing_in_source', [])
+        if missing_source:
+            lines.append(f"-- Restore Target-only rows (if deleted in forward migration) ({len(missing_source)} sample rows)")
+            for item in missing_source:
+                row = item.get('row', {})
+                if row:
+                    cols_to_insert = [c for c in common_cols if c in row]
+                    cols_sql = ", ".join([quote_ident(c) for c in cols_to_insert])
+                    vals_sql = ", ".join([format_val(row[c]) for c in cols_to_insert])
+                    lines.append(f"INSERT INTO {quote_ident(t_name)} ({cols_sql}) VALUES ({vals_sql}) ON CONFLICT DO NOTHING;")
+                    
+    return "\n".join(lines)
+
+def generate_rollback_script(
+    source_snap: Optional[Dict[str, Any]] = None,
+    target_snap: Optional[Dict[str, Any]] = None,
+    diffs: Optional[List[Dict[str, Any]]] = None,
+    data_diff: Optional[Dict[str, Any]] = None,
+    safe_mode: bool = True,
+    include_ddl: bool = True,
+    include_data: bool = True
+) -> Dict[str, Any]:
+    """
+    Generates a complete atomic Target Rollback / Pre-Migration Backup SQL script.
+    Allows reverting all changes applied by the forward sync script.
+    """
+    sections = []
+    
+    header = [
+        "-- ====================================================================",
+        "-- DB Compare Target Pre-Migration Backup & Rollback Script",
+        f"-- Generated at: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        "-- Direction: Target Modified -> Revert to Original Target State",
+        "-- Zero-Retention Architecture: In-Memory Engine",
+        "-- ====================================================================",
+        "",
+        "BEGIN;",
+        ""
+    ]
+    sections.append("\n".join(header))
+    
+    ddl_sql = ""
+    if include_ddl and source_snap and target_snap and diffs:
+        ddl_sql = generate_ddl_rollback_script(source_snap, target_snap, diffs, safe_mode)
+        if ddl_sql.strip():
+            sections.append(ddl_sql)
+            
+    data_sql = ""
+    if include_data and data_diff:
+        data_sql = generate_data_rollback_script(data_diff, safe_mode)
+        if data_sql.strip():
+            sections.append(data_sql)
+            
+    footer = [
+        "",
+        "-- ====================================================================",
+        "-- Verification and Commit",
+        "-- ====================================================================",
+        "COMMIT;",
+        ""
+    ]
+    sections.append("\n".join(footer))
+    
+    full_sql = "\n".join(sections)
+    statements_count = len([line for line in full_sql.splitlines() if line.strip() and not line.strip().startswith('--')])
+    
+    return {
+        "sql": full_sql,
+        "stats": {
+            "safe_mode": safe_mode,
+            "statements_count": statements_count,
+            "has_ddl": bool(ddl_sql.strip()),
+            "has_data": bool(data_sql.strip())
+        }
+    }

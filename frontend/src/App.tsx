@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import { 
-  Database, Shield, ShieldAlert, ArrowRightLeft, Play, Settings2, Loader2, 
+  Database, Shield, ShieldAlert, ShieldCheck, ArrowRightLeft, Play, Settings2, Loader2, 
   CheckCircle2, XCircle, TerminalSquare, Clock, Filter, Copy, Check, Download, 
-  Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2
+  Table, ChevronDown, ChevronRight, FileText, RefreshCw, Trash2, Undo2
 } from 'lucide-react';
 
 type ProviderType = 'aws' | 'azure' | 'oracle' | 'supabase' | 'local';
@@ -136,11 +136,14 @@ export default function App() {
   const [ddlFilter, setDdlFilter] = useState<string>('all');
   const [expandedTables, setExpandedTables] = useState<Record<string, boolean>>({});
 
-  // Sync Script modal
+  // Sync & Rollback Script modal
   const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
   const [syncLoading, setSyncLoading] = useState(false);
   const [syncScript, setSyncScript] = useState('');
   const [syncStats, setSyncStats] = useState<any>(null);
+  const [rollbackScript, setRollbackScript] = useState('');
+  const [rollbackStats, setRollbackStats] = useState<any>(null);
+  const [activeScriptTab, setActiveScriptTab] = useState<'migration' | 'rollback'>('migration');
   const [syncSafeMode, setSyncSafeMode] = useState(true);
   const [syncIncludeDdl, setSyncIncludeDdl] = useState(true);
   const [syncIncludeData, setSyncIncludeData] = useState(true);
@@ -311,23 +314,39 @@ export default function App() {
   const handleFetchSyncScript = async (safe = syncSafeMode, withDdl = syncIncludeDdl, withData = syncIncludeData) => {
     setSyncLoading(true);
     try {
-      const res = await fetch('http://localhost:8000/api/generate-sync-script', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source_snap: sourceSnap,
-          target_snap: targetSnap,
-          diffs: diffs,
-          data_diff: dataDiff,
-          safe_mode: safe,
-          include_ddl: withDdl,
-          include_data: withData
+      const payload = {
+        source_snap: sourceSnap,
+        target_snap: targetSnap,
+        diffs: diffs,
+        data_diff: dataDiff,
+        safe_mode: safe,
+        include_ddl: withDdl,
+        include_data: withData
+      };
+
+      const [syncRes, rollbackRes] = await Promise.all([
+        fetch('http://localhost:8000/api/generate-sync-script', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        }),
+        fetch('http://localhost:8000/api/generate-rollback-script', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
         })
-      });
-      if (!res.ok) throw new Error("Failed to generate sync script");
-      const data = await res.json();
-      setSyncScript(data.sql);
-      setSyncStats(data.stats);
+      ]);
+
+      if (!syncRes.ok) throw new Error("Failed to generate migration script");
+      if (!rollbackRes.ok) throw new Error("Failed to generate rollback script");
+
+      const syncData = await syncRes.json();
+      const rollbackData = await rollbackRes.json();
+
+      setSyncScript(syncData.sql);
+      setSyncStats(syncData.stats);
+      setRollbackScript(rollbackData.sql);
+      setRollbackStats(rollbackData.stats);
     } catch (e) {
       alert("Error generating script: " + e);
     } finally {
@@ -337,21 +356,34 @@ export default function App() {
 
   const openSyncModal = () => {
     setIsSyncModalOpen(true);
+    setActiveScriptTab('migration');
     handleFetchSyncScript(syncSafeMode, syncIncludeDdl, syncIncludeData);
   };
 
   const handleCopyScript = () => {
-    navigator.clipboard.writeText(syncScript);
+    const textToCopy = activeScriptTab === 'migration' ? syncScript : rollbackScript;
+    navigator.clipboard.writeText(textToCopy);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleDownloadScript = () => {
+  const handleDownloadMigrationScript = () => {
     const blob = new Blob([syncScript], { type: 'text/sql;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.setAttribute('download', `namangya_sync_${new Date().toISOString().slice(0,10)}.sql`);
+    link.setAttribute('download', `forward_migration_${new Date().toISOString().slice(0,10)}.sql`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleDownloadRollbackScript = () => {
+    const blob = new Blob([rollbackScript], { type: 'text/sql;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', `target_pre_migration_backup_${new Date().toISOString().slice(0,10)}.sql`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -1032,10 +1064,10 @@ export default function App() {
                 <div>
                   <h3 className="text-xl font-bold text-slate-100 flex items-center gap-2">
                     <FileText size={20} className="text-orange-400" />
-                    Generated Synchronization Script
+                    Migration & Pre-Migration Rollback Scripts
                   </h3>
                   <p className="text-xs text-slate-400 mt-1">
-                    Auto-generated DDL and data migration statements to bring Target up to parity with Source.
+                    Auto-generated forward sync script and inverse target rollback script for safe, zero-risk migrations.
                   </p>
                 </div>
                 <button 
@@ -1046,8 +1078,29 @@ export default function App() {
                 </button>
               </div>
 
+              {/* Safety Recommendation Banner */}
+              <div className="mx-6 mt-4 p-3.5 bg-emerald-950/40 border border-emerald-500/40 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-inner">
+                <div className="flex items-center gap-2.5 text-emerald-200">
+                  <ShieldCheck size={20} className="text-emerald-400 shrink-0" />
+                  <div>
+                    <span className="font-semibold text-emerald-300">Safety Recommendation: Pre-Migration Backup Ready</span>
+                    <p className="text-[11px] text-emerald-400/80 mt-0.5">
+                      Download the Target Rollback Script before executing forward changes in Production to restore previous schema and row data if needed.
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={handleDownloadRollbackScript}
+                  disabled={syncLoading || !rollbackScript}
+                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-lg flex items-center justify-center gap-1.5 shrink-0 transition-all shadow-md shadow-emerald-900/30 cursor-pointer disabled:opacity-50"
+                >
+                  <Download size={14} />
+                  Download Rollback (.sql)
+                </button>
+              </div>
+
               {/* Modal Options Bar */}
-              <div className="px-6 py-3 bg-slate-800/40 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs">
+              <div className="px-6 py-3 bg-slate-800/40 border-b border-slate-800 flex flex-wrap items-center justify-between gap-4 text-xs mt-3">
                 <div className="flex items-center gap-4">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input 
@@ -1095,11 +1148,54 @@ export default function App() {
                   </label>
                 </div>
 
-                {syncStats && (
-                  <div className="flex items-center gap-3 text-slate-400 font-mono">
-                    <span>Statements: <strong className="text-orange-400">{syncStats.statements_count}</strong></span>
-                  </div>
-                )}
+                <div className="flex items-center gap-3 text-slate-400 font-mono text-[11px]">
+                  <span>Migration: <strong className="text-orange-400">{syncStats?.statements_count ?? 0}</strong> stmts</span>
+                  <span className="text-slate-600">|</span>
+                  <span>Rollback: <strong className="text-emerald-400">{rollbackStats?.statements_count ?? 0}</strong> stmts</span>
+                </div>
+              </div>
+
+              {/* Script Tab Switcher */}
+              <div className="px-6 pt-3 flex items-center justify-between border-b border-slate-800 bg-slate-900">
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setActiveScriptTab('migration')}
+                    className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-all border-b-2 cursor-pointer flex items-center gap-2 ${
+                      activeScriptTab === 'migration'
+                        ? 'text-orange-400 border-orange-500 bg-slate-800/60 font-semibold'
+                        : 'text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/30'
+                    }`}
+                  >
+                    <FileText size={14} />
+                    Forward Migration Script
+                    {syncStats && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-orange-500/20 text-orange-300 border border-orange-500/30">
+                        {syncStats.statements_count} stmts
+                      </span>
+                    )}
+                  </button>
+
+                  <button
+                    onClick={() => setActiveScriptTab('rollback')}
+                    className={`px-4 py-2 text-xs font-medium rounded-t-lg transition-all border-b-2 cursor-pointer flex items-center gap-2 ${
+                      activeScriptTab === 'rollback'
+                        ? 'text-emerald-400 border-emerald-500 bg-slate-800/60 font-semibold'
+                        : 'text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/30'
+                    }`}
+                  >
+                    <Undo2 size={14} />
+                    Target Pre-Migration Rollback Script
+                    {rollbackStats && (
+                      <span className="px-1.5 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                        {rollbackStats.statements_count} stmts
+                      </span>
+                    )}
+                  </button>
+                </div>
+
+                <span className="text-[11px] text-slate-500 font-mono hidden sm:inline">
+                  {activeScriptTab === 'migration' ? 'Target → Source Parity' : 'Target → Restore Original State'}
+                </span>
               </div>
 
               {/* Code viewer */}
@@ -1107,51 +1203,64 @@ export default function App() {
                 {syncLoading ? (
                   <div className="h-64 flex flex-col items-center justify-center space-y-3">
                     <Loader2 size={28} className="animate-spin text-orange-500" />
-                    <p className="text-sm text-slate-400">Synthesizing PostgreSQL migration script...</p>
+                    <p className="text-sm text-slate-400">Synthesizing PostgreSQL migration and rollback scripts...</p>
                   </div>
                 ) : (
                   <div className="relative">
                     <div className="flex items-center justify-between px-4 py-2.5 bg-slate-950 border border-b-0 border-slate-800 rounded-t-xl text-xs text-slate-400">
-                      <span className="font-mono text-slate-300">PostgreSQL Migration Script ({syncScript.split('\n').length} lines)</span>
+                      <span className="font-mono text-slate-300">
+                        {activeScriptTab === 'migration' ? 'Forward Migration Script' : 'Target Rollback Script'} ({(activeScriptTab === 'migration' ? syncScript : rollbackScript).split('\n').length} lines)
+                      </span>
                       <button
                         onClick={handleCopyScript}
                         className="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 flex items-center gap-1.5 transition-all cursor-pointer"
                       >
                         {copied ? <Check size={14} className="text-green-400" /> : <Copy size={14} />}
-                        {copied ? 'Copied to Clipboard!' : 'Copy Script'}
+                        {copied ? 'Copied to Clipboard!' : `Copy ${activeScriptTab === 'migration' ? 'Migration' : 'Rollback'}`}
                       </button>
                     </div>
                     <pre className="p-4 bg-slate-950 rounded-b-xl border border-slate-800 text-xs font-mono text-slate-200 overflow-x-auto leading-relaxed select-all max-h-[50vh]">
-                      {syncScript}
+                      {activeScriptTab === 'migration' ? syncScript : rollbackScript}
                     </pre>
                   </div>
                 )}
               </div>
 
               {/* Modal Footer */}
-              <div className="p-6 border-t border-slate-800 flex items-center justify-between bg-slate-900/50">
+              <div className="p-6 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-4 bg-slate-900/50">
                 <p className="text-xs text-slate-500 flex items-center gap-1.5">
                   <Shield size={14} className="text-green-400" />
-                  Script runs inside a single atomic transaction (<code className="text-slate-400">BEGIN; ... COMMIT;</code>)
+                  Both scripts run inside atomic transactions (<code className="text-slate-400">BEGIN; ... COMMIT;</code>)
                 </p>
 
                 <div className="flex items-center gap-3">
                   <button
                     onClick={handleCopyScript}
-                    disabled={syncLoading || !syncScript}
+                    disabled={syncLoading || !(activeScriptTab === 'migration' ? syncScript : rollbackScript)}
                     className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium rounded-xl border border-slate-700 transition-colors flex items-center gap-2 cursor-pointer disabled:opacity-50"
                   >
                     {copied ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
-                    {copied ? 'Copied to Clipboard' : 'Copy SQL'}
+                    {copied ? 'Copied' : 'Copy Active SQL'}
                   </button>
 
                   <button
-                    onClick={handleDownloadScript}
-                    disabled={syncLoading || !syncScript}
-                    className="px-5 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    onClick={handleDownloadRollbackScript}
+                    disabled={syncLoading || !rollbackScript}
+                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 text-white text-sm font-medium rounded-xl shadow-lg shadow-emerald-700/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    title="Download safety rollback script to revert Target changes"
                   >
                     <Download size={16} />
-                    Download .sql
+                    Download Rollback (.sql)
+                  </button>
+
+                  <button
+                    onClick={handleDownloadMigrationScript}
+                    disabled={syncLoading || !syncScript}
+                    className="px-5 py-2 bg-orange-600 hover:bg-orange-500 text-white text-sm font-medium rounded-xl shadow-lg shadow-orange-500/20 transition-all flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                    title="Download forward migration script"
+                  >
+                    <Download size={16} />
+                    Download Migration (.sql)
                   </button>
                 </div>
               </div>

@@ -43,6 +43,7 @@ DB Compare provides comprehensive inspection, delta diffing, and migration scrip
 - **Strict Zero-Retention**: All connection configurations, credentials, and uploaded SSH `.pem` identity keys are held exclusively in RAM and discarded immediately after use.
 - **Credential Sanitization**: Backend error handlers intercept exceptions and strip database passwords and connection strings before returning responses to clients.
 - **Configurable CORS**: Supports environment-configurable origin whitelisting (`ALLOWED_ORIGINS`) to prevent unauthorized cross-origin requests.
+- **Target Pre-Migration Backup & Rollback**: Automatically generates an inverse rollback SQL script that captures the exact pre-migration state of all modified Target DDL objects (restoring original view definitions, column types, and routines) and affected row data (restoring original pre-update values and removing injected rows) for safe one-click rollbacks.
 - **Safe Mode Migrations**: Generated synchronization scripts comment out destructive operations (`DROP COLUMN`, `DROP TABLE`, `DROP ROLE`, `DELETE`) by default with explicit review markers.
 - **Transactional Execution**: All generated sync scripts are wrapped in atomic transaction blocks (`BEGIN; ... COMMIT;`).
 

@@ -11,7 +11,7 @@ import re
 from db_inspector import get_object_counts, get_schema_snapshot
 from differ import compute_delta
 from data_inspector import compare_all_data
-from sync_generator import generate_sync_script
+from sync_generator import generate_sync_script, generate_rollback_script
 
 app = FastAPI(
     title="DB Compare API",
@@ -245,6 +245,26 @@ async def compare_data_endpoint(req: DataCompareRequest):
 async def generate_sync_script_endpoint(req: SyncScriptRequest):
     try:
         result = generate_sync_script(
+            source_snap=req.source_snap,
+            target_snap=req.target_snap,
+            diffs=req.diffs,
+            data_diff=req.data_diff,
+            safe_mode=req.safe_mode if req.safe_mode is not None else True,
+            include_ddl=req.include_ddl if req.include_ddl is not None else True,
+            include_data=req.include_data if req.include_data is not None else True
+        )
+        return {
+            "status": "success",
+            "sql": result["sql"],
+            "stats": result["stats"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=sanitize_error(e))
+
+@app.post("/api/generate-rollback-script")
+async def generate_rollback_script_endpoint(req: SyncScriptRequest):
+    try:
+        result = generate_rollback_script(
             source_snap=req.source_snap,
             target_snap=req.target_snap,
             diffs=req.diffs,
